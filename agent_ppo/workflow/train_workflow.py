@@ -11,6 +11,7 @@ Author: Tencent AI Arena Authors
 import os
 import time
 import random
+import math
 from agent_ppo.feature.definition import (
     sample_process,
     build_frame,
@@ -23,6 +24,12 @@ from tools.env_conf_manager import EnvConfManager
 from tools.model_pool_utils import get_valid_model_pool
 from tools.metrics_utils import get_training_metrics
 from common_python.utils.workflow_disaster_recovery import handle_disaster_recovery
+
+
+def cosine_schedule(start, end, progress):
+    # progress 从 0 到 1，返回 start 到 end 的平滑调度值。
+    progress = max(0.0, min(1.0, progress))
+    return end + 0.5 * (start - end) * (1 + math.cos(math.pi * progress))
 
 
 def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
@@ -143,6 +150,7 @@ class EpisodeRunner:
             usr_conf, is_eval, monitor_side = self.env_conf_manager.update_config(lineup)
             self.current_opponent_agent = self._select_opponent_agent(usr_conf, is_eval)
             self._set_usr_conf_opponent_agent(usr_conf, self.current_opponent_agent)
+            self._apply_stage_hparams()
 
             # Call init_config on agents to get summoner skill selections
             # 调用 agent 的 init_config 获取召唤师技能选择，注入 usr_conf
@@ -329,6 +337,12 @@ class EpisodeRunner:
     def _select_opponent_agent(self, usr_conf, is_eval):
         if is_eval and CurriculumConfig.EVAL_ALWAYS_COMMON_AI:
             return "common_ai"
+        stage = self._stage()
+        stage_opponent = stage.get("opponent")
+        if stage_opponent == "common_ai":
+            return "common_ai"
+        if stage_opponent in ("common_ai_plus_short_selfplay", "selfplay_history_pool_common_ai_eval"):
+            return self._select_stage_mixed_opponent(stage_opponent)
         base_opponent = self._get_usr_conf_opponent_agent(usr_conf) or self.env_conf_manager.get_opponent_agent()
         if is_eval or not CurriculumConfig.ENABLE_CURRICULUM:
             return base_opponent
@@ -336,6 +350,32 @@ class EpisodeRunner:
             return "common_ai"
         selfplay_prob = self._curriculum_selfplay_prob()
         return "selfplay" if random.random() < selfplay_prob else "common_ai"
+
+    def _select_stage_mixed_opponent(self, stage_opponent):
+        if stage_opponent == "common_ai_plus_short_selfplay":
+            return "selfplay" if random.random() < 0.15 else "common_ai"
+        roll = random.random()
+        if roll < 0.20:
+            return "common_ai"
+        return "selfplay"
+
+    def _stage(self):
+        stage_name = os.environ.get("HOK_CURRICULUM_STAGE", CurriculumConfig.CURRENT_STAGE)
+        return CurriculumConfig.CURRICULUM_STAGES.get(stage_name, CurriculumConfig.CURRICULUM_STAGES["S1_BASIC"])
+
+    def _apply_stage_hparams(self):
+        stage = self._stage()
+        progress = min(1.0, self.train_episode_cnt / max(1, CurriculumConfig.SELFPLAY_RAMP_EPISODES))
+        lr = cosine_schedule(stage.get("lr_start", 3e-4), stage.get("lr_end", 8e-5), progress)
+        entropy_coef = cosine_schedule(stage.get("entropy_start", 0.02), stage.get("entropy_end", 0.005), progress)
+        clip_eps = cosine_schedule(stage.get("clip_start", 0.20), stage.get("clip_end", 0.12), progress)
+        for agent in self.agents:
+            if hasattr(agent, "optimizer"):
+                for group in agent.optimizer.param_groups:
+                    group["lr"] = lr
+            if hasattr(agent, "model"):
+                agent.model.var_beta = entropy_coef
+                agent.model.clip_param = clip_eps
 
     def _curriculum_selfplay_prob(self):
         if self._common_ai_gate_passed():

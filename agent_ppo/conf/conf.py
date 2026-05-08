@@ -9,53 +9,72 @@ Author: Tencent AI Arena Authors
 
 
 class GameConfig:
-    # 奖励权重统一在这里调整，reward_process.py 只负责计算每一项的原始奖励值。
-    # 调参原则：
-    # 1. 推塔相关权重最高，因为本任务胜利条件是摧毁敌方防御塔。
-    # 2. 发育、补刀、打英雄是辅助目标，权重不能高过推塔。
-    # 3. 血包奖励要小，避免模型为了吃血包放弃推塔窗口。
-    # 4. 惩罚项保持温和但持续，帮助模型学会少送死、少乱进塔。
-    REWARD_WEIGHT_DICT = {
-        # 终局奖励：只有对局结束时触发。
-        "win": 16.0,  # 获胜奖励
-        "lose": -12.0,  # 失败惩罚
-        "timeout": -4.0,  # 超时惩罚
+    # ===== 模型与特征不变量 =====
+    # 固定内部特征维度；训练开始后禁止修改，否则旧模型不能安全续训。
+    FEATURE_DIM = 512
+    # LSTM 隐状态维度；checkpoint 会校验该值。
+    LSTM_HIDDEN_SIZE = 256
+    # LSTM 层数；方案要求单层。
+    LSTM_NUM_LAYERS = 1
+    # learner 按 16 帧切成一个序列训练。
+    LSTM_TIME_STEPS = 16
+    # 官方六头动作协议：button、move_x、move_z、skill_x、skill_z、target。
+    LABEL_SIZE_LIST = [12, 16, 16, 16, 16, 9]
+    # 当前模型版本；checkpoint 元信息使用。
+    MODEL_VERSION = "ppo_lstm_512_v1"
 
-        # 推塔主线：最重要的 dense reward。
-        "enemy_tower_damage": 10.0,  # 敌方防御塔掉血
-        "own_tower_damage": -6.0,  # 己方防御塔掉血
+    # ===== 功能模块开关 =====
+    # 是否启用 LSTM 序列模型。
+    USE_LSTM = True
+    # 是否启用历史记忆模块。
+    USE_MEMORY_PROCESS = True
+    # 是否启用规则控制器，规则只产出 hard mask 和 logit bias。
+    USE_RULE_CONTROLLER = True
+    # 是否启用敌我防御塔范围探索。
+    USE_TOWER_RANGE_EXPLORER = True
+    # 是否启用血包 cake 和神符探索。
+    USE_CAKE_RUNE_EXPLORER = True
+    # 是否启用中立资源探索。
+    USE_NEUTRAL_OBJECTIVE = True
+    # 是否启用对手近期行为统计。
+    USE_OPPONENT_BEHAVIOR_MEMORY = True
+    # 是否启用技能和强化普攻连招记忆。
+    USE_COMBO_MEMORY = True
 
-        # 推塔窗口：鼓励抓住关键推塔机会。
-        "enhanced_tower_hit": 5.0,  # 强化普攻命中防御塔
-        "death_window_tower": 7.0,  # 敌方死亡期间推进/点塔
+    # ===== 禁止普通血量变化 reward =====
+    # 禁止奖励敌方英雄普通掉血。
+    USE_HERO_DAMAGE_REWARD = False
+    # 禁止奖励敌方小兵普通掉血。
+    USE_MINION_DAMAGE_REWARD = False
+    # 禁止奖励精灵或野怪普通掉血。
+    USE_NEUTRAL_DAMAGE_REWARD = False
+    # 禁止对自己逐帧掉血惩罚。
+    USE_SELF_HP_DELTA_PENALTY = False
+    # 禁止对己方小兵逐帧掉血惩罚。
+    USE_FRIENDLY_MINION_HP_DELTA_PENALTY = False
 
-        # 塔下安全：减少乱进塔和被塔锁定。
-        "tower_target_self": -0.25,  # 敌塔正在攻击自己
-        "unsafe_tower_exposure": -0.12,  # 低血或危险情况下暴露在敌塔范围
-
-        # 兵线与补刀：帮助模型理解清线是为了推塔。
-        "lane_push": 0.45,  # 兵线向敌塔推进
-        "enemy_minion_kill": 0.25,  # 击杀/压低敌方小兵
-        "last_hit": 0.2,  # 自己完成补刀
-
-        # 发育奖励：低权重辅助信号。
-        "gold": 0.05,  # 金币增长
-        "exp": 0.05,  # 经验增长
-        "level_up": 0.3,  # 升级
-
-        # 英雄战斗：鼓励优势换血，但不让目标偏离推塔。
-        "enemy_hero_damage": 0.25,  # 对敌方英雄造成伤害
-        "self_damage_taken": -0.25,  # 自己受到伤害
-        "kill": 0.8,  # 击杀敌方英雄
-        "death": -2.5,  # 自己死亡
-
-        # 血包：只作为低血保命辅助。
-        "blood_pack_heal": 0.25,  # 安全吃血包后回血
-        "ignore_safe_blood_pack": -0.01,  # 低血且安全血包在附近却不靠近
-
-        # 视野风险：敌方丢视野且自己处于危险状态时轻微惩罚。
-        "vision_risk": -0.03,
+    # 奖励权重统一在这里调整，reward_process.py 只负责计算每一项原始值。
+    # 注意：这里不包含普通英雄掉血、小兵掉血、野怪掉血、自身掉血逐帧惩罚。
+    REWARD_WEIGHTS = {
+        "terminal_win": 20.0,  # 获胜终局奖励
+        "terminal_lose": -20.0,  # 失败终局惩罚
+        "timeout": -6.0,  # 超时惩罚
+        "enemy_tower_delta": 8.0,  # 敌方防御塔血量下降奖励
+        "own_tower_delta": -10.0,  # 己方防御塔血量下降惩罚
+        "lane": 1.0,  # 兵线推进和线权奖励
+        "growth": 0.8,  # 金币、经验、等级成长奖励
+        "last_hit": 0.2,  # 自己完成补刀奖励
+        "death": -4.0,  # 自己死亡惩罚
+        "tower_risk": -1.5,  # 危险塔下暴露惩罚
+        "enhanced_tower": 1.0,  # 强化普攻点塔奖励
+        "death_window_tower_mult": 1.5,  # 敌方死亡窗口推塔倍率
+        "neutral_result": 0.5,  # 明确拿到中立资源奖励
+        "cake_safe_pick": 0.2,  # 低血安全吃 cake 的小奖励
+        "skill_result": 0.3,  # 技能明确结果奖励
+        "bad_resource": -1.0,  # 错误争资源惩罚
     }
+    # 兼容旧代码入口。
+    REWARD_WEIGHT_DICT = REWARD_WEIGHTS
 
     # 单步总奖励裁剪范围，防止 reward_sum 过大导致 PPO 梯度震荡。
     REWARD_SUM_CLIP_MIN = -10.0
@@ -115,6 +134,15 @@ class RuleConfig:
     BULLET_DANGER_DIST = 4500
     BULLET_DANGER_HP_RATIO = 0.45
 
+    # 规则 bias 的绝对上限；禁止 +5、+10 这种过强偏置。
+    LOGIT_BIAS_ABS_MAX = 2.0
+
+    # hard mask 比例超过该值时，应把非关键屏蔽降级为 bias。
+    HARD_MASK_RATE_LIMIT = 0.20
+
+    # fallback 动作，所有 head 被屏蔽时回退到 noop。
+    NOOP_ACTION = [0, 15, 15, 15, 15, 0]
+
 
 class CurriculumConfig:
     # 课程训练开关：
@@ -154,10 +182,69 @@ class CurriculumConfig:
     # 未过门槛但超过 FORCE_SELFPLAY_AFTER_EPISODES 后的探索性 selfplay 概率。
     FALLBACK_SELFPLAY_PROB = 0.10
 
+    # 当前课程阶段名；可通过配置或环境变量切换，不需要改训练代码。
+    CURRENT_STAGE = "S1_BASIC"
+
+    # 四阶段课程配置。只允许阶段间调整 reward、rule bias、对手和超参。
+    CURRICULUM_STAGES = {
+        "S1_BASIC": {
+            "opponent": "common_ai",  # 基础阶段，对手固定 common_ai
+            "enable_rule_bias": False,  # 关闭复杂规则偏置
+            "enable_resource_reward": False,  # 关闭资源奖励
+            "enable_skill_result_reward": False,  # 关闭技能结果奖励
+            "enable_cake_reward": False,  # 关闭 cake 奖励
+            "lr_start": 3e-4,  # 阶段起始学习率
+            "lr_end": 2.3e-4,  # 阶段结束学习率
+            "entropy_start": 0.020,  # 阶段起始熵系数
+            "entropy_end": 0.015,  # 阶段结束熵系数
+            "clip_start": 0.20,  # 阶段起始 PPO clip
+            "clip_end": 0.18,  # 阶段结束 PPO clip
+            "ppo_epoch": 1,  # 每批样本更新轮数
+        },
+        "S2_TOWER_WINDOW": {
+            "opponent": "common_ai",
+            "enable_rule_bias": True,
+            "enable_enhanced_tower_reward": True,
+            "enable_death_window_reward": True,
+            "lr_start": 2.3e-4,
+            "lr_end": 1.7e-4,
+            "entropy_start": 0.015,
+            "entropy_end": 0.011,
+            "clip_start": 0.18,
+            "clip_end": 0.16,
+            "ppo_epoch": 1,
+        },
+        "S3_MECHANISM": {
+            "opponent": "common_ai_plus_short_selfplay",
+            "enable_resource_reward": True,
+            "enable_skill_result_reward": True,
+            "enable_cake_reward": True,
+            "lr_start": 1.7e-4,
+            "lr_end": 1.2e-4,
+            "entropy_start": 0.011,
+            "entropy_end": 0.008,
+            "clip_start": 0.16,
+            "clip_end": 0.15,
+            "ppo_epoch": 1,
+        },
+        "S4_GENERALIZATION": {
+            "opponent": "selfplay_history_pool_common_ai_eval",
+            "enable_opponent_behavior": True,
+            "enable_resource_bias": True,
+            "lr_start": 1.2e-4,
+            "lr_end": 8e-5,
+            "entropy_start": 0.008,
+            "entropy_end": 0.005,
+            "clip_start": 0.15,
+            "clip_end": 0.12,
+            "ppo_epoch": 1,  # 稳定后可切为 2
+        },
+    }
+
 
 class DimConfig:
     # 模型输入特征维度。当前采用 512 维大特征协议，未使用维度填 0。
-    FEATURE_DIM = 512
+    FEATURE_DIM = GameConfig.FEATURE_DIM
 
     # 合法动作 mask 维度：12 + 16 + 16 + 16 + 16 + 9 = 85。
     LEGAL_ACTION_DIM = 85
@@ -171,19 +258,19 @@ class Config:
     NETWORK_NAME = "network"
 
     # PPO 按 16 帧拼成一个训练样本；环境每 step 对应 6 frame。
-    LSTM_TIME_STEPS = 16
+    LSTM_TIME_STEPS = GameConfig.LSTM_TIME_STEPS
 
-    # 保留官方 LSTM 状态协议维度。当前模型不真正使用 LSTM 计算，只透传状态以兼容框架。
-    LSTM_UNIT_SIZE = 512
+    # LSTM hidden/cell 维度；episode reset 后必须清零，checkpoint 不保存单局隐状态。
+    LSTM_UNIT_SIZE = GameConfig.LSTM_HIDDEN_SIZE
 
     # 输入维度。
     FEATURE_DIM = DimConfig.FEATURE_DIM
     LEGAL_ACTION_DIM = DimConfig.LEGAL_ACTION_DIM
 
     # Residual MLP 网络超参数。
-    MODEL_HIDDEN_DIM = 512  # LayerNorm 后第一层隐藏维度
-    MODEL_EMBED_DIM = 256  # Residual MLP 输出到 policy/value 前的公共 embedding
-    MODEL_RESIDUAL_BLOCK_NUM = 2  # 残差块数量
+    MODEL_HIDDEN_DIM = 512  # FrameEncoder 第一层隐藏维度
+    MODEL_EMBED_DIM = 256  # FrameEncoder 输出维度，同时作为 LSTM 输入维度
+    MODEL_RESIDUAL_BLOCK_NUM = 0  # LSTM 版不再使用残差块
     POLICY_HIDDEN_DIM = 256  # policy encoder 隐藏维度
     VALUE_HIDDEN_DIM = 256  # value encoder 隐藏维度
 
@@ -220,18 +307,18 @@ class Config:
 
     # 学习率调度：从 INIT_LEARNING_RATE_START 线性衰减到 TARGET_LR。
     INIT_LEARNING_RATE_START = 3e-4
-    TARGET_LR = 5e-5
+    TARGET_LR = 8e-5
     TARGET_STEP = 10000
 
     # PPO 熵正则权重，越大探索越强，但过大可能导致策略不收敛。
-    BETA_START = 0.025
+    BETA_START = 0.020
 
     # log 计算稳定项。
     LOG_EPSILON = 1e-6
 
     # 动作空间维度：button、move_x、move_z、skill_x、skill_z、target。
     # 不要随意修改，否则 action mask、样本格式和环境动作都会不兼容。
-    LABEL_SIZE_LIST = [12, 16, 16, 16, 16, 9]
+    LABEL_SIZE_LIST = GameConfig.LABEL_SIZE_LIST
 
     # 每个动作头是否参与 PPO policy loss。
     IS_REINFORCE_TASK_LIST = [
@@ -244,7 +331,7 @@ class Config:
     ]
 
     # PPO clip 参数，常用范围 0.1 - 0.3。
-    CLIP_PARAM = 0.2
+    CLIP_PARAM = 0.20
 
     # 合法动作 softmax 的最小概率，防止 log(0)。
     MIN_POLICY = 0.00001
@@ -285,12 +372,34 @@ class Config:
     LEGAL_ACTION_SIZE_LIST[-1] = LEGAL_ACTION_SIZE_LIST[-1] * LEGAL_ACTION_SIZE_LIST[0]
 
     # GAE 折扣参数。GAMMA 越高越重视长期收益，LAMDA 控制 bias/variance。
-    GAMMA = 0.995
+    GAMMA = 0.997
     LAMDA = 0.95
 
     # 梯度裁剪，防止 reward 或 advantage 波动导致梯度爆炸。
     USE_GRAD_CLIP = True
     GRAD_CLIP_RANGE = 0.5
+
+    # PPO value loss 系数。
+    VALUE_LOSS_COEF = 0.5
+
+    # PPO 熵系数初始值和最终值，由课程调度覆盖。
+    ENTROPY_COEF_INIT = 0.020
+    ENTROPY_COEF_FINAL = 0.005
+
+    # PPO clip 初始值和最终值，由课程调度覆盖。
+    PPO_CLIP_INIT = 0.20
+    PPO_CLIP_FINAL = 0.12
+
+    # 学习率初始值和最终值，由课程调度覆盖。
+    LR_INIT = 3e-4
+    LR_FINAL = 8e-5
+
+    # PPO 更新轮数；课程后期稳定后可增至 2。
+    PPO_EPOCH = 1
+    PPO_EPOCH_FINAL = 2
+
+    # learner mini batch 大小。
+    MINI_BATCH_SIZE = 512
 
     # learner 从 Reverb 接收的单条样本总维度。
     SAMPLE_DIM = sum(DATA_SPLIT_SHAPE[:-2]) * LSTM_TIME_STEPS + sum(DATA_SPLIT_SHAPE[-2:])

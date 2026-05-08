@@ -39,7 +39,7 @@ def lineup_iterator_roundrobin_camp_heroes(camp_heroes=None):
     return _lineup_iterator_shuffle_cycle(camps)
 
 
-ObsData = create_cls("ObsData", feature=None, legal_action=None, lstm_cell=None, lstm_hidden=None)
+ObsData = create_cls("ObsData", feature=None, legal_action=None, lstm_cell=None, lstm_hidden=None, aux=None, observation=None)
 
 # ActData needs to contain d_action and d_prob, used for visualization
 # ActData 需要包含 d_action 和 d_prob, 用于可视化智能体预测概率
@@ -52,6 +52,9 @@ ActData = create_cls(
     value=None,
     lstm_cell=None,
     lstm_hidden=None,
+    final_legal_action=None,
+    rule_bias=None,
+    rule_state=None,
 )
 
 # SampleData for training, total dimension is sum of all data_shapes
@@ -92,9 +95,14 @@ def build_frame(agent, observation):
     sub_action_mask = observation["sub_action_mask"]
 
     prob, value, action = act_data.prob, act_data.value, act_data.action
-    lstm_cell, lstm_hidden = act_data.lstm_cell, act_data.lstm_hidden
+    # 训练序列第一步必须使用采样动作前的 h0/c0，而不是模型输出后的 next hidden。
+    lstm_cell, lstm_hidden = obs_data.lstm_cell, obs_data.lstm_hidden
 
-    legal_action = _update_legal_action(observation["legal_action"], action)
+    legal_action = (
+        np.asarray(act_data.final_legal_action, dtype=np.float32)
+        if getattr(act_data, "final_legal_action", None) is not None
+        else _update_legal_action(observation["legal_action"], action)
+    )
     frame = Frame(
         frame_no=frame_no,
         feature=feature_vec.reshape([-1]),
@@ -108,7 +116,7 @@ def build_frame(agent, observation):
         prob=prob,
         sub_action=_get_sub_action_mask(sub_action_mask, action[0]),
         lstm_info=np.concatenate([lstm_cell.flatten(), lstm_hidden.flatten()]).reshape([-1]),
-        is_train=False if action[0] < 0 or getattr(agent, "rule_override", False) else is_train,
+        is_train=False if action[0] < 0 else is_train,
     )
     return frame
 
@@ -275,6 +283,12 @@ class FrameCollector:
                     # 将样本数组包装为 SampleData 对象
                     self.m_replay_buffer[i].append(SampleData(sample=sample_array))
                     sample_lstm = rl_info.lstm_info
+                    sample_batch = np.zeros([self._LSTM_FRAME, sample_one_size])
+
+            if cnt > 0:
+                # 不足 16 帧的尾段用 0 padding，padding 的 is_train 默认为 0，loss 会忽略。
+                sample_array = self._reshape_lstm_batch_sample(sample_batch, sample_lstm)
+                self.m_replay_buffer[i].append(SampleData(sample=sample_array))
 
     def _clip_reward(self, reward, max=100, min=-100):
         if reward > max:

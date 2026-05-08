@@ -99,10 +99,15 @@ class Algorithm:
 
         now = time.time()
         if now - self.last_report_monitor_time >= 60:
-            _, (value_loss, policy_loss, entropy_loss) = _info_list
+            _, loss_items = _info_list
+            value_loss, policy_loss, entropy_loss = loss_items[:3]
             results["value_loss"] = round(value_loss, 2)
             results["policy_loss"] = round(policy_loss, 2)
             results["entropy_loss"] = round(entropy_loss, 2)
+            results["learning_rate"] = round(self.optimizer.param_groups[0]["lr"], 8)
+            if len(loss_items) >= 5:
+                results["approx_kl"] = round(loss_items[3], 4)
+                results["clip_fraction"] = round(loss_items[4], 4)
             if self.monitor:
                 self.monitor.put_data({os.getpid(): results})
             self.last_report_monitor_time = now

@@ -1,290 +1,224 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
 ###########################################################################
-# Copyright © 1998 - 2026 Tencent. All Rights Reserved.
+# Copyright 1998 - 2026 Tencent. All Rights Reserved.
 ###########################################################################
 """
-Author: Tencent AI Arena Authors
+PPO LSTM actor-critic model.
 """
 
-
-import torch
-import torch.nn as nn
-from torch.nn import ModuleDict
-
-import numpy as np
 from typing import List
 
-from agent_ppo.conf.conf import DimConfig, Config
+import numpy as np
+import torch
+import torch.nn as nn
+
+from agent_ppo.conf.conf import Config, DimConfig
 
 
-class Model(nn.Module):
+class MLP(nn.Module):
+    def __init__(self, dims: List[int], act=nn.ReLU):
+        super().__init__()
+        layers = []
+        for i in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            if i < len(dims) - 2:
+                layers.append(act())
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class PPOActorCriticLSTM(nn.Module):
+    def __init__(self, feature_dim=512, hidden_size=256, label_sizes=None, num_layers=1):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.label_sizes = label_sizes or [12, 16, 16, 16, 16, 9]
+
+        self.in_ln = nn.LayerNorm(feature_dim)
+        self.frame_encoder = MLP([feature_dim, 512, 256])
+        self.lstm = nn.LSTM(256, hidden_size, num_layers=num_layers, batch_first=True)
+        self.policy_encoder = MLP([hidden_size, 256, 256])
+        self.value_encoder = MLP([hidden_size, 256, 256])
+        self.action_heads = nn.ModuleList([nn.Linear(256, n) for n in self.label_sizes])
+        self.value_head = nn.Linear(256, 1)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.orthogonal_(module.weight, gain=nn.init.calculate_gain("relu"))
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0.0)
+        for head in getattr(self, "action_heads", []):
+            nn.init.orthogonal_(head.weight, gain=0.01)
+            nn.init.constant_(head.bias, 0.0)
+        if hasattr(self, "value_head"):
+            nn.init.orthogonal_(self.value_head.weight, gain=1.0)
+            nn.init.constant_(self.value_head.bias, 0.0)
+
+    def init_hidden(self, batch_size, device):
+        h = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=device)
+        c = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=device)
+        return h, c
+
+    def forward(self, features, hidden=None):
+        # features: 推理 [B, 512] 或 [B, 1, 512]；训练 [B, T, 512]。
+        if features.dim() == 2:
+            features = features.unsqueeze(1)
+        batch_size, _, dim = features.shape
+        if dim != self.feature_dim:
+            raise ValueError(f"feature dim must be {self.feature_dim}, got {dim}")
+
+        x = self.in_ln(features)
+        x = self.frame_encoder(x)
+        if hidden is None:
+            hidden = self.init_hidden(batch_size, features.device)
+        lstm_out, next_hidden = self.lstm(x, hidden)
+        pi_x = self.policy_encoder(lstm_out)
+        v_x = self.value_encoder(lstm_out)
+        logits = [head(pi_x) for head in self.action_heads]
+        value = self.value_head(v_x).squeeze(-1)
+        return logits, value, next_hidden
+
+
+class Model(PPOActorCriticLSTM):
     def __init__(self):
-        super(Model, self).__init__()
-        # feature configure parameter
-        # 特征配置参数
+        super().__init__(
+            feature_dim=DimConfig.FEATURE_DIM,
+            hidden_size=Config.LSTM_UNIT_SIZE,
+            label_sizes=Config.LABEL_SIZE_LIST,
+        )
         self.model_name = Config.NETWORK_NAME
         self.data_split_shape = Config.DATA_SPLIT_SHAPE
         self.lstm_time_steps = Config.LSTM_TIME_STEPS
         self.lstm_unit_size = Config.LSTM_UNIT_SIZE
         self.seri_vec_split_shape = Config.SERI_VEC_SPLIT_SHAPE
-        self.m_learning_rate = Config.INIT_LEARNING_RATE_START
-        self.m_var_beta = Config.BETA_START
-        self.log_epsilon = Config.LOG_EPSILON
         self.label_size_list = Config.LABEL_SIZE_LIST
         self.is_reinforce_task_list = Config.IS_REINFORCE_TASK_LIST
         self.min_policy = Config.MIN_POLICY
         self.clip_param = Config.CLIP_PARAM
-        self.restore_list = []
-        self.var_beta = self.m_var_beta
-        self.learning_rate = self.m_learning_rate
-        self.target_embed_dim = Config.TARGET_EMBED_DIM
-        self.cut_points = [value[0] for value in Config.data_shapes]
+        self.var_beta = Config.BETA_START
+        self.learning_rate = Config.INIT_LEARNING_RATE_START
         self.legal_action_size = Config.LEGAL_ACTION_SIZE_LIST
-
-        self.feature_dim = Config.SERI_VEC_SPLIT_SHAPE[0][0]
-        self.legal_action_dim = np.sum(Config.LEGAL_ACTION_SIZE_LIST)
-        self.lstm_hidden_dim = Config.LSTM_UNIT_SIZE
-
-        # NETWORK DIM
-        # 网络维度
-        self.hero_data_len = sum(Config.data_shapes[0])
-        self.feature_dim = int(DimConfig.DIM_OF_FEATURE[0])
-        hidden_dim = Config.MODEL_HIDDEN_DIM
-        embed_dim = Config.MODEL_EMBED_DIM
-        policy_hidden_dim = Config.POLICY_HIDDEN_DIM
-        value_hidden_dim = Config.VALUE_HIDDEN_DIM
-
-        self.feature_norm = nn.LayerNorm(self.feature_dim)
-        self.feature_fc = make_fc_layer(self.feature_dim, hidden_dim)
-        self.feature_relu = nn.ReLU()
-        self.res_blocks = nn.Sequential(
-            *[
-                ResidualBlock(hidden_dim, "residual_block{0}".format(index + 1))
-                for index in range(Config.MODEL_RESIDUAL_BLOCK_NUM)
-            ]
-        )
-        self.feature_proj = MLP([hidden_dim, embed_dim], "feature_proj", non_linearity_last=True)
-        self.policy_encoder = MLP([embed_dim, policy_hidden_dim], "policy_encoder", non_linearity_last=True)
-        self.value_encoder = MLP([embed_dim, value_hidden_dim], "value_encoder", non_linearity_last=True)
-
-        self.lstm = torch.nn.LSTM(
-            input_size=self.lstm_unit_size,
-            hidden_size=self.lstm_unit_size,
-            num_layers=1,
-            bias=True,
-            batch_first=True,
-            dropout=0,
-            bidirectional=False,
-        )
-
-        self.label_mlp = ModuleDict(
-            {
-                "hero_label{0}_mlp".format(label_index): MLP(
-                    [policy_hidden_dim, policy_hidden_dim, self.label_size_list[label_index]],
-                    "hero_label{0}_mlp".format(label_index),
-                )
-                for label_index in range(len(self.label_size_list))
-            }
-        )
-        self.lstm_tar_embed_mlp = make_fc_layer(self.lstm_unit_size, self.target_embed_dim)
-
-        self.value_mlp = MLP([value_hidden_dim, value_hidden_dim, 1], "hero_value_mlp")
-
-        self.target_embed_mlp = make_fc_layer(self.target_embed_dim, self.target_embed_dim, use_bias=False)
+        self.cut_points = [value[0] for value in Config.data_shapes]
+        self.restore_list = []
 
     def forward(self, data_list, inference=False):
         feature_vec, lstm_hidden_init, lstm_cell_init = data_list
+        if feature_vec.dim() == 1:
+            feature_vec = feature_vec.reshape(-1, self.feature_dim)
 
-        self.lstm_cell_output = lstm_cell_init.unsqueeze(0)
-        self.lstm_hidden_output = lstm_hidden_init.unsqueeze(0)
+        if lstm_hidden_init.dim() == 1:
+            lstm_hidden_init = lstm_hidden_init.reshape(-1, self.lstm_unit_size)
+        if lstm_cell_init.dim() == 1:
+            lstm_cell_init = lstm_cell_init.reshape(-1, self.lstm_unit_size)
 
-        result_list = []
+        batch_size = lstm_hidden_init.shape[0]
+        time_steps = 1 if inference else self.lstm_time_steps
+        expected = batch_size * time_steps
+        if feature_vec.shape[0] != expected:
+            time_steps = max(1, feature_vec.shape[0] // max(1, batch_size))
+        features = feature_vec.reshape(batch_size, time_steps, self.feature_dim)
+        hidden = (lstm_hidden_init.unsqueeze(0), lstm_cell_init.unsqueeze(0))
 
-        # public concat
-        # 公共连接层
-        feature_result = self.feature_norm(feature_vec)
-        feature_result = self.feature_relu(self.feature_fc(feature_result))
-        feature_result = self.res_blocks(feature_result)
-        fc_public_result = self.feature_proj(feature_result)
-        policy_result = self.policy_encoder(fc_public_result)
-        value_public_result = self.value_encoder(fc_public_result)
-
-        # output label
-        # 输出标签
-        for label_index, label_dim in enumerate(self.label_size_list[:]):
-            label_mlp_out = self.label_mlp["hero_label{0}_mlp".format(label_index)](policy_result)
-            result_list.append(label_mlp_out)
-
-        # output value
-        # 输出价值
-        value_result = self.value_mlp(value_public_result)
-        result_list.append(value_result)
-
-        # prepare for infer graph
-        # 准备推理图
-        logits = torch.flatten(torch.cat(result_list[:-1], 1), start_dim=1)
-        value = result_list[-1]
+        logits_seq, value_seq, (next_hidden, next_cell) = super().forward(features, hidden)
+        self.lstm_hidden_output = next_hidden
+        self.lstm_cell_output = next_cell
 
         if inference:
-            return [logits, value, self.lstm_cell_output, self.lstm_hidden_output]
-        else:
-            return result_list
+            logits = torch.cat([head[:, -1, :] for head in logits_seq], dim=1)
+            value = value_seq[:, -1:].reshape(batch_size, 1)
+            return [logits, value, next_cell, next_hidden]
+
+        flat_logits = [head.reshape(-1, head.shape[-1]) for head in logits_seq]
+        flat_value = value_seq.reshape(-1, 1)
+        return flat_logits + [flat_value]
 
     def compute_loss(self, data_list, rst_list):
         seri_vec = data_list[0].reshape(-1, self.data_split_shape[0])
         device = seri_vec.device
-        usq_reward = data_list[1].reshape(-1, self.data_split_shape[1])
-        usq_advantage = data_list[2].reshape(-1, self.data_split_shape[2])
-        usq_is_train = data_list[-3].reshape(-1, self.data_split_shape[-3])
+        reward = data_list[1].reshape(-1, self.data_split_shape[1]).squeeze(1)
+        advantage = data_list[2].reshape(-1, self.data_split_shape[2]).squeeze(1)
+        frame_is_train = data_list[-3].reshape(-1, self.data_split_shape[-3]).squeeze(1)
 
-        usq_label_list = data_list[3 : 3 + len(self.label_size_list)]
-        for shape_index in range(len(self.label_size_list)):
-            usq_label_list[shape_index] = (
-                usq_label_list[shape_index].reshape(-1, self.data_split_shape[3 + shape_index]).long()
-            )
-
-        old_label_probability_list = data_list[3 + len(self.label_size_list) : 3 + 2 * len(self.label_size_list)]
-        for shape_index in range(len(self.label_size_list)):
-            old_label_probability_list[shape_index] = old_label_probability_list[shape_index].reshape(
-                -1, self.data_split_shape[3 + len(self.label_size_list) + shape_index]
-            )
-
-        usq_weight_list = data_list[3 + 2 * len(self.label_size_list) : 3 + 3 * len(self.label_size_list)]
-        for shape_index in range(len(self.label_size_list)):
-            usq_weight_list[shape_index] = usq_weight_list[shape_index].reshape(
-                -1,
-                self.data_split_shape[3 + 2 * len(self.label_size_list) + shape_index],
-            )
-
-        # squeeze tensor
-        # 压缩张量
-        reward = usq_reward.squeeze(dim=1)
-        advantage = usq_advantage.squeeze(dim=1)
         label_list = []
-        for ele in usq_label_list:
-            label_list.append(ele.squeeze(dim=1))
+        for i in range(len(self.label_size_list)):
+            label = data_list[3 + i].reshape(-1, self.data_split_shape[3 + i]).long().squeeze(1)
+            label_list.append(label)
+
+        old_prob_list = []
+        old_prob_start = 3 + len(self.label_size_list)
+        for i in range(len(self.label_size_list)):
+            old_prob = data_list[old_prob_start + i].reshape(
+                -1, self.data_split_shape[old_prob_start + i]
+            )
+            old_prob_list.append(old_prob)
+
         weight_list = []
-        for weight in usq_weight_list:
-            weight_list.append(weight.squeeze(dim=1))
-        frame_is_train = usq_is_train.squeeze(dim=1)
+        weight_start = 3 + 2 * len(self.label_size_list)
+        for i in range(len(self.label_size_list)):
+            weight = data_list[weight_start + i].reshape(-1, self.data_split_shape[weight_start + i]).squeeze(1)
+            weight_list.append(weight)
 
-        label_result = rst_list[:-1]
-
-        value_result = rst_list[-1]
-
-        _, split_feature_legal_action = torch.split(
+        _, split_legal_action = torch.split(
             seri_vec,
-            [
-                np.prod(self.seri_vec_split_shape[0]),
-                np.prod(self.seri_vec_split_shape[1]),
-            ],
+            [np.prod(self.seri_vec_split_shape[0]), np.prod(self.seri_vec_split_shape[1])],
             dim=1,
         )
-        feature_legal_action_shape = list(self.seri_vec_split_shape[1])
-        feature_legal_action_shape.insert(0, -1)
-        feature_legal_action = split_feature_legal_action.reshape(feature_legal_action_shape)
+        legal_action_list = torch.split(split_legal_action, self.label_size_list, dim=1)
+        label_result = rst_list[:-1]
+        value_result = rst_list[-1].squeeze(1)
 
-        legal_action_flag_list = torch.split(feature_legal_action, self.label_size_list, dim=1)
+        valid_count = torch.maximum(frame_is_train.sum(), torch.tensor(1.0, device=device))
+        self.value_cost = 0.5 * ((value_result - reward) ** 2 * frame_is_train).sum() / valid_count
 
-        # loss of value net
-        # 值网络的损失
-        fc2_value_result_squeezed = value_result.squeeze(dim=1)
-        self.value_cost = 0.5 * torch.mean(torch.square(reward - fc2_value_result_squeezed), dim=0)
-        new_advantage = reward - fc2_value_result_squeezed
-        self.value_cost = 0.5 * torch.mean(torch.square(new_advantage), dim=0)
-
-        # for entropy loss calculate
-        # 用于熵损失计算
-        label_probability_list = []
-
-        epsilon = 1e-5
-
-        # policy loss: ppo clip loss
-        # 策略损失：PPO剪辑损失
         self.policy_cost = torch.tensor(0.0, device=device)
-        for task_index in range(len(self.is_reinforce_task_list)):
-            if self.is_reinforce_task_list[task_index]:
-                final_log_p = torch.tensor(0.0, device=device)
-                boundary = torch.pow(torch.tensor(10.0, device=device), torch.tensor(20.0, device=device))
-                one_hot_actions = nn.functional.one_hot(label_list[task_index].long(), self.label_size_list[task_index])
+        entropy_total = torch.tensor(0.0, device=device)
+        clip_fraction_total = torch.tensor(0.0, device=device)
+        approx_kl_total = torch.tensor(0.0, device=device)
+        reinforce_heads = 0
+        eps = 1e-6
 
-                legal_action_flag_list_max_mask = (1 - legal_action_flag_list[task_index]) * boundary
+        for i, reinforce in enumerate(self.is_reinforce_task_list):
+            if not reinforce:
+                continue
+            reinforce_heads += 1
+            logits = label_result[i]
+            legal = legal_action_list[i].float()
+            legal = torch.where(legal.sum(dim=1, keepdim=True) > 0, legal, torch.ones_like(legal))
+            masked_logits = logits.masked_fill(legal <= 0, -1e9)
+            prob = torch.softmax(masked_logits, dim=1)
+            dist = torch.distributions.Categorical(probs=prob)
 
-                label_logits_subtract_max = torch.clamp(
-                    label_result[task_index]
-                    - torch.max(
-                        label_result[task_index] - legal_action_flag_list_max_mask,
-                        dim=1,
-                        keepdim=True,
-                    ).values,
-                    -boundary,
-                    1,
-                )
+            action = label_list[i].clamp(0, self.label_size_list[i] - 1)
+            new_logprob = dist.log_prob(action)
+            old_action_prob = (nn.functional.one_hot(action, self.label_size_list[i]).float() * old_prob_list[i]).sum(1)
+            old_logprob = torch.log(old_action_prob + eps)
 
-                label_exp_logits = (
-                    legal_action_flag_list[task_index] * torch.exp(label_logits_subtract_max) + self.min_policy
-                )
+            ratio = torch.exp(new_logprob - old_logprob).clamp(0.0, 3.0)
+            surr1 = ratio * advantage
+            surr2 = ratio.clamp(1.0 - self.clip_param, 1.0 + self.clip_param) * advantage
+            head_mask = weight_list[i].float() * frame_is_train
+            denom = torch.maximum(head_mask.sum(), torch.tensor(1.0, device=device))
+            self.policy_cost = self.policy_cost - (torch.minimum(surr1, surr2) * head_mask).sum() / denom
+            entropy_total = entropy_total + (dist.entropy() * head_mask).sum() / denom
 
-                label_sum_exp_logits = label_exp_logits.sum(1, keepdim=True)
+            with torch.no_grad():
+                log_ratio = new_logprob - old_logprob
+                approx_kl_total = approx_kl_total + (((torch.exp(log_ratio) - 1.0) - log_ratio) * head_mask).sum() / denom
+                clip_fraction_total = clip_fraction_total + (((ratio - 1.0).abs() > self.clip_param).float() * head_mask).sum() / denom
 
-                label_probability = 1.0 * label_exp_logits / label_sum_exp_logits
-                label_probability_list.append(label_probability)
-
-                policy_p = (one_hot_actions * label_probability).sum(1)
-                policy_log_p = torch.log(policy_p + epsilon)
-                old_policy_p = (one_hot_actions * old_label_probability_list[task_index] + epsilon).sum(1)
-                old_policy_log_p = torch.log(old_policy_p)
-                final_log_p = final_log_p + policy_log_p - old_policy_log_p
-                ratio = torch.exp(final_log_p)
-                clip_ratio = ratio.clamp(0.0, 3.0)
-
-                surr1 = clip_ratio * advantage
-                surr2 = ratio.clamp(1.0 - self.clip_param, 1.0 + self.clip_param) * advantage
-                temp_policy_loss = -torch.sum(
-                    torch.minimum(surr1, surr2) * (weight_list[task_index].float()) * frame_is_train
-                ) / torch.maximum(
-                    torch.sum((weight_list[task_index].float()) * frame_is_train), torch.tensor(1.0, device=device)
-                )
-
-                self.policy_cost = self.policy_cost + temp_policy_loss
-
-        # cross entropy loss
-        # 交叉熵损失
-        current_entropy_loss_index = 0
-        entropy_loss_list = []
-        for task_index in range(len(self.is_reinforce_task_list)):
-            if self.is_reinforce_task_list[task_index]:
-                temp_entropy_loss = -torch.sum(
-                    label_probability_list[current_entropy_loss_index]
-                    * legal_action_flag_list[task_index]
-                    * torch.log(label_probability_list[current_entropy_loss_index] + epsilon),
-                    dim=1,
-                )
-
-                temp_entropy_loss = -torch.sum(
-                    (temp_entropy_loss * weight_list[task_index].float() * frame_is_train)
-                ) / torch.maximum(
-                    torch.sum(weight_list[task_index].float() * frame_is_train), torch.tensor(1.0, device=device)
-                )
-
-                entropy_loss_list.append(temp_entropy_loss)
-                current_entropy_loss_index = current_entropy_loss_index + 1
-            else:
-                temp_entropy_loss = torch.tensor(0.0, device=device)
-                entropy_loss_list.append(temp_entropy_loss)
-
-        self.entropy_cost = torch.tensor(0.0, device=device)
-        for entropy_element in entropy_loss_list:
-            self.entropy_cost = self.entropy_cost + entropy_element
-
-        self.entropy_cost_list = entropy_loss_list
-
-        self.loss = self.value_cost + self.policy_cost + self.var_beta * self.entropy_cost
-
+        normalizer = max(1, reinforce_heads)
+        self.entropy_cost = -(entropy_total / normalizer)
+        self.approx_kl = approx_kl_total / normalizer
+        self.clip_fraction = clip_fraction_total / normalizer
+        self.loss = Config.VALUE_LOSS_COEF * self.value_cost + self.policy_cost + self.var_beta * self.entropy_cost
         return self.loss, [
             self.loss,
-            [self.value_cost, self.policy_cost, self.entropy_cost],
+            [self.value_cost, self.policy_cost, self.entropy_cost, self.approx_kl, self.clip_fraction],
         ]
 
     def set_train_mode(self):
@@ -294,48 +228,3 @@ class Model(nn.Module):
     def set_eval_mode(self):
         self.lstm_time_steps = 1
         self.eval()
-
-
-def make_fc_layer(in_features: int, out_features: int, use_bias=True):
-    fc_layer = nn.Linear(in_features, out_features, bias=use_bias)
-
-    nn.init.orthogonal_(fc_layer.weight)
-    if use_bias:
-        nn.init.zeros_(fc_layer.bias)
-
-    return fc_layer
-
-
-class ResidualBlock(nn.Module):
-    def __init__(self, hidden_dim: int, name: str):
-        super(ResidualBlock, self).__init__()
-        self.block = nn.Sequential()
-        self.block.add_module("{0}_norm1".format(name), nn.LayerNorm(hidden_dim))
-        self.block.add_module("{0}_fc1".format(name), make_fc_layer(hidden_dim, hidden_dim))
-        self.block.add_module("{0}_relu1".format(name), nn.ReLU())
-        self.block.add_module("{0}_norm2".format(name), nn.LayerNorm(hidden_dim))
-        self.block.add_module("{0}_fc2".format(name), make_fc_layer(hidden_dim, hidden_dim))
-        self.block.add_module("{0}_relu2".format(name), nn.ReLU())
-
-    def forward(self, data):
-        return data + self.block(data)
-
-
-class MLP(nn.Module):
-    def __init__(
-        self,
-        fc_feat_dim_list: List[int],
-        name: str,
-        non_linearity: nn.Module = nn.ReLU,
-        non_linearity_last: bool = False,
-    ):
-        super(MLP, self).__init__()
-        self.fc_layers = nn.Sequential()
-        for i in range(len(fc_feat_dim_list) - 1):
-            fc_layer = make_fc_layer(fc_feat_dim_list[i], fc_feat_dim_list[i + 1])
-            self.fc_layers.add_module("{0}_fc{1}".format(name, i + 1), fc_layer)
-            if i + 1 < len(fc_feat_dim_list) - 1 or non_linearity_last:
-                self.fc_layers.add_module("{0}_non_linear{1}".format(name, i + 1), non_linearity())
-
-    def forward(self, data):
-        return self.fc_layers(data)
