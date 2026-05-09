@@ -1,230 +1,347 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
 ###########################################################################
-# Copyright 1998 - 2026 Tencent. All Rights Reserved.
+# Copyright © 1998 - 2026 Tencent. All Rights Reserved.
 ###########################################################################
 """
-PPO LSTM actor-critic model.
+D401 replica model.
+
+Compared with the baseline model, this version:
+1. Actually uses LSTM for train/inference.
+2. Splits the baseline feature into hero/tower groups and encodes them before fusion.
+3. Keeps 6 official action heads.
+4. Uses a naive target-attention head for the target branch.
+5. Adds value clipping and optional dual-clip PPO in compute_loss.
 """
 
+import math
 from typing import List
 
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.nn import ModuleDict
 
-from agent_ppo.conf.conf import Config, DimConfig
-
-
-class MLP(nn.Module):
-    def __init__(self, dims: List[int], act=nn.ReLU):
-        super().__init__()
-        layers = []
-        for i in range(len(dims) - 1):
-            layers.append(nn.Linear(dims[i], dims[i + 1]))
-            if i < len(dims) - 2:
-                layers.append(act())
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.net(x)
+from agent_ppo.conf.conf import DimConfig, Config, GameConfig
 
 
-class PPOActorCriticLSTM(nn.Module):
-    def __init__(self, feature_dim=512, hidden_size=256, label_sizes=None, num_layers=1):
-        super().__init__()
-        self.feature_dim = feature_dim
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.label_sizes = label_sizes or [12, 16, 16, 16, 16, 9]
-
-        self.in_ln = nn.LayerNorm(feature_dim)
-        self.frame_encoder = MLP([feature_dim, 512, 256])
-        self.lstm = nn.LSTM(256, hidden_size, num_layers=num_layers, batch_first=True)
-        self.policy_encoder = MLP([hidden_size, 256, 256])
-        self.value_encoder = MLP([hidden_size, 256, 256])
-        self.action_heads = nn.ModuleList([nn.Linear(256, n) for n in self.label_sizes])
-        self.value_head = nn.Linear(256, 1)
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.orthogonal_(module.weight, gain=nn.init.calculate_gain("relu"))
-            if module.bias is not None:
-                nn.init.constant_(module.bias, 0.0)
-        for head in getattr(self, "action_heads", []):
-            nn.init.orthogonal_(head.weight, gain=0.01)
-            nn.init.constant_(head.bias, 0.0)
-        if hasattr(self, "value_head"):
-            nn.init.orthogonal_(self.value_head.weight, gain=1.0)
-            nn.init.constant_(self.value_head.bias, 0.0)
-
-    def init_hidden(self, batch_size, device):
-        h = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=device)
-        c = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=device)
-        return h, c
-
-    def forward(self, features, hidden=None):
-        # features: 推理 [B, 512] 或 [B, 1, 512]；训练 [B, T, 512]。
-        if features.dim() == 2:
-            features = features.unsqueeze(1)
-        batch_size, _, dim = features.shape
-        if dim != self.feature_dim:
-            raise ValueError(f"feature dim must be {self.feature_dim}, got {dim}")
-
-        x = self.in_ln(features)
-        x = self.frame_encoder(x)
-        if hidden is None:
-            hidden = self.init_hidden(batch_size, features.device)
-        lstm_out, next_hidden = self.lstm(x, hidden)
-        pi_x = self.policy_encoder(lstm_out)
-        v_x = self.value_encoder(lstm_out)
-        logits = [head(pi_x) for head in self.action_heads]
-        value = self.value_head(v_x).squeeze(-1)
-        return logits, value, next_hidden
-
-
-class Model(PPOActorCriticLSTM):
+class Model(nn.Module):
     def __init__(self):
-        super().__init__(
-            feature_dim=DimConfig.FEATURE_DIM,
-            hidden_size=Config.LSTM_UNIT_SIZE,
-            label_sizes=Config.LABEL_SIZE_LIST,
-        )
+        super(Model, self).__init__()
         self.model_name = Config.NETWORK_NAME
         self.data_split_shape = Config.DATA_SPLIT_SHAPE
         self.lstm_time_steps = Config.LSTM_TIME_STEPS
         self.lstm_unit_size = Config.LSTM_UNIT_SIZE
         self.seri_vec_split_shape = Config.SERI_VEC_SPLIT_SHAPE
+        self.m_learning_rate = Config.INIT_LEARNING_RATE_START
+        self.m_var_beta = Config.BETA_START
+        self.log_epsilon = Config.LOG_EPSILON
         self.label_size_list = Config.LABEL_SIZE_LIST
         self.is_reinforce_task_list = Config.IS_REINFORCE_TASK_LIST
         self.min_policy = Config.MIN_POLICY
         self.clip_param = Config.CLIP_PARAM
-        self.var_beta = Config.BETA_START
-        self.learning_rate = Config.INIT_LEARNING_RATE_START
-        self.ppo_epoch = Config.PPO_EPOCH
-        self.legal_action_size = Config.LEGAL_ACTION_SIZE_LIST
+        self.target_embed_dim = Config.TARGET_EMBED_DIM
         self.cut_points = [value[0] for value in Config.data_shapes]
-        self.restore_list = []
+        self.legal_action_size = Config.LEGAL_ACTION_SIZE_LIST
+        self.var_beta = self.m_var_beta
+        self.learning_rate = self.m_learning_rate
+
+        self.feature_dim = int(DimConfig.DIM_OF_FEATURE[0])
+        self.legal_action_dim = int(np.sum(Config.LEGAL_ACTION_SIZE_LIST))
+        self.lstm_hidden_dim = Config.LSTM_UNIT_SIZE
+
+        # Baseline feature split: hero(3) + enemy tower/organ(7).
+        # If the baseline feature process is expanded later, update these slices explicitly.
+        self.hero_feature_dim = min(3, self.feature_dim)
+        self.organ_feature_dim = max(0, self.feature_dim - self.hero_feature_dim)
+
+        self.hero_encoder = MLP([self.hero_feature_dim, 64, 128], "hero_encoder", non_linearity_last=True)
+        self.organ_encoder = MLP([max(1, self.organ_feature_dim), 64, 128], "organ_encoder", non_linearity_last=True)
+        self.fusion_mlp = MLP([256, 512, self.lstm_unit_size], "fusion_mlp", non_linearity_last=True)
+
+        self.lstm = nn.LSTM(
+            input_size=self.lstm_unit_size,
+            hidden_size=self.lstm_unit_size,
+            num_layers=1,
+            bias=True,
+            batch_first=True,
+            dropout=0,
+            bidirectional=False,
+        )
+
+        # First five action branches are standard MLP heads.
+        self.label_mlp = ModuleDict(
+            {
+                "hero_label{0}_mlp".format(label_index): MLP(
+                    [self.lstm_unit_size, 256, self.label_size_list[label_index]],
+                    "hero_label{0}_mlp".format(label_index),
+                )
+                for label_index in range(len(self.label_size_list) - 1)
+            }
+        )
+
+        # Naive target attention: query from LSTM output, key per official target index.
+        self.lstm_tar_embed_mlp = make_fc_layer(self.lstm_unit_size, self.target_embed_dim)
+        self.target_unit_embedding = nn.Embedding(self.label_size_list[-1], self.target_embed_dim)
+        nn.init.orthogonal_(self.target_unit_embedding.weight)
+
+        self.value_mlp = MLP([self.lstm_unit_size, 256, 1], "hero_value_mlp")
+        # D401 multi-critic style value heads. In this drop-in replica branch the
+        # sample still stores one global return, so group heads are trained as
+        # auxiliary value estimates against the same target. If later group
+        # returns are serialized, compute_loss can be extended without changing
+        # the model interface.
+        self.reward_groups = list(getattr(GameConfig, "REWARD_GROUPS", {}).keys())
+        self.value_group_mlps = ModuleDict(
+            {
+                group: MLP([self.lstm_unit_size, 128, 1], f"hero_value_{group}_mlp")
+                for group in self.reward_groups
+            }
+        )
+
+    def _encode_feature(self, feature_vec: torch.Tensor) -> torch.Tensor:
+        hero_feat = feature_vec[:, : self.hero_feature_dim]
+        organ_feat = feature_vec[:, self.hero_feature_dim :]
+        if self.organ_feature_dim <= 0:
+            organ_feat = torch.zeros((feature_vec.shape[0], 1), device=feature_vec.device, dtype=feature_vec.dtype)
+        hero_emb = self.hero_encoder(hero_feat)
+        organ_emb = self.organ_encoder(organ_feat)
+        return self.fusion_mlp(torch.cat([hero_emb, organ_emb], dim=1))
 
     def forward(self, data_list, inference=False):
         feature_vec, lstm_hidden_init, lstm_cell_init = data_list
-        if feature_vec.dim() == 1:
-            feature_vec = feature_vec.reshape(-1, self.feature_dim)
-
-        if lstm_hidden_init.dim() == 1:
-            lstm_hidden_init = lstm_hidden_init.reshape(-1, self.lstm_unit_size)
-        if lstm_cell_init.dim() == 1:
-            lstm_cell_init = lstm_cell_init.reshape(-1, self.lstm_unit_size)
-
         batch_size = lstm_hidden_init.shape[0]
-        time_steps = 1 if inference else self.lstm_time_steps
-        expected = batch_size * time_steps
-        if feature_vec.shape[0] != expected:
-            time_steps = max(1, feature_vec.shape[0] // max(1, batch_size))
-        features = feature_vec.reshape(batch_size, time_steps, self.feature_dim)
-        hidden = (lstm_hidden_init.unsqueeze(0), lstm_cell_init.unsqueeze(0))
+        total_frames = feature_vec.shape[0]
+        time_steps = max(1, total_frames // max(1, batch_size))
 
-        logits_seq, value_seq, (next_hidden, next_cell) = super().forward(features, hidden)
-        self.lstm_hidden_output = next_hidden
-        self.lstm_cell_output = next_cell
+        encoded = self._encode_feature(feature_vec)
+        lstm_input = encoded.reshape(batch_size, time_steps, self.lstm_unit_size)
 
+        h0 = lstm_hidden_init.unsqueeze(0).contiguous()
+        c0 = lstm_cell_init.unsqueeze(0).contiguous()
+        lstm_out, (h_n, c_n) = self.lstm(lstm_input, (h0, c0))
+        lstm_flat = lstm_out.reshape(-1, self.lstm_unit_size)
+
+        self.lstm_hidden_output = h_n
+        self.lstm_cell_output = c_n
+
+        result_list = []
+        for label_index in range(len(self.label_size_list) - 1):
+            result_list.append(self.label_mlp[f"hero_label{label_index}_mlp"](lstm_flat))
+
+        target_query = self.lstm_tar_embed_mlp(lstm_flat)
+        target_keys = self.target_unit_embedding.weight
+        target_logits = torch.matmul(target_query, target_keys.t()) / math.sqrt(float(self.target_embed_dim))
+        result_list.append(target_logits)
+
+        value_result = self.value_mlp(lstm_flat)
+        group_values = [self.value_group_mlps[group](lstm_flat) for group in self.reward_groups]
+        result_list.append(value_result)
+        result_list.extend(group_values)
+
+        logits = torch.flatten(torch.cat(result_list[: len(self.label_size_list)], 1), start_dim=1)
         if inference:
-            logits = torch.cat([head[:, -1, :] for head in logits_seq], dim=1)
-            value = value_seq[:, -1:].reshape(batch_size, 1)
-            return [logits, value, next_cell, next_hidden]
-
-        flat_logits = [head.reshape(-1, head.shape[-1]) for head in logits_seq]
-        flat_value = value_seq.reshape(-1, 1)
-        return flat_logits + [flat_value]
+            if len(group_values) > 0:
+                group_value_tensor = torch.cat(group_values, dim=1)
+            else:
+                group_value_tensor = torch.zeros((value_result.shape[0], 0), device=value_result.device)
+            return [logits, value_result, group_value_tensor, self.lstm_cell_output, self.lstm_hidden_output]
+        return result_list
 
     def compute_loss(self, data_list, rst_list):
+        label_num = len(self.label_size_list)
+        group_num = int(getattr(Config, "REWARD_GROUP_NUM", 0))
+
         seri_vec = data_list[0].reshape(-1, self.data_split_shape[0])
-        device = seri_vec.device
-        reward = data_list[1].reshape(-1, self.data_split_shape[1]).squeeze(1)
-        advantage = data_list[2].reshape(-1, self.data_split_shape[2]).squeeze(1)
-        frame_is_train = data_list[-3].reshape(-1, self.data_split_shape[-3]).squeeze(1)
+        usq_reward = data_list[1].reshape(-1, self.data_split_shape[1])
+        usq_advantage = data_list[2].reshape(-1, self.data_split_shape[2])
 
-        label_list = []
-        for i in range(len(self.label_size_list)):
-            label = data_list[3 + i].reshape(-1, self.data_split_shape[3 + i]).long().squeeze(1)
-            label_list.append(label)
+        group_return_start = 3
+        group_adv_start = group_return_start + group_num
+        action_start = group_adv_start + group_num
+        old_prob_start = action_start + label_num
+        weight_start = old_prob_start + label_num
+        old_value_idx = weight_start + label_num
+        old_group_value_start = old_value_idx + 1
+        is_train_idx = old_group_value_start + group_num
 
-        old_prob_list = []
-        old_prob_start = 3 + len(self.label_size_list)
-        for i in range(len(self.label_size_list)):
-            old_prob = data_list[old_prob_start + i].reshape(
-                -1, self.data_split_shape[old_prob_start + i]
-            )
-            old_prob_list.append(old_prob)
+        group_returns = []
+        group_advantages = []
+        for g in range(group_num):
+            group_returns.append(data_list[group_return_start + g].reshape(-1, self.data_split_shape[group_return_start + g]).squeeze(dim=1))
+            group_advantages.append(data_list[group_adv_start + g].reshape(-1, self.data_split_shape[group_adv_start + g]).squeeze(dim=1))
 
-        rule_bias_list = []
-        rule_bias_start = old_prob_start + len(self.label_size_list)
-        for i in range(len(self.label_size_list)):
-            rule_bias = data_list[rule_bias_start + i].reshape(
-                -1, self.data_split_shape[rule_bias_start + i]
-            )
-            rule_bias_list.append(rule_bias)
+        old_value = data_list[old_value_idx].reshape(-1, self.data_split_shape[old_value_idx]).squeeze(dim=1)
+        old_group_values = []
+        for g in range(group_num):
+            idx = old_group_value_start + g
+            old_group_values.append(data_list[idx].reshape(-1, self.data_split_shape[idx]).squeeze(dim=1))
 
-        weight_list = []
-        weight_start = 3 + 3 * len(self.label_size_list)
-        for i in range(len(self.label_size_list)):
-            weight = data_list[weight_start + i].reshape(-1, self.data_split_shape[weight_start + i]).squeeze(1)
-            weight_list.append(weight)
+        usq_is_train = data_list[is_train_idx].reshape(-1, self.data_split_shape[is_train_idx])
 
-        _, split_legal_action = torch.split(
+        usq_label_list = data_list[action_start : action_start + label_num]
+        for shape_index in range(label_num):
+            idx = action_start + shape_index
+            usq_label_list[shape_index] = usq_label_list[shape_index].reshape(-1, self.data_split_shape[idx]).long()
+
+        old_label_probability_list = data_list[old_prob_start : old_prob_start + label_num]
+        for shape_index in range(label_num):
+            idx = old_prob_start + shape_index
+            old_label_probability_list[shape_index] = old_label_probability_list[shape_index].reshape(-1, self.data_split_shape[idx])
+
+        usq_weight_list = data_list[weight_start : weight_start + label_num]
+        for shape_index in range(label_num):
+            idx = weight_start + shape_index
+            usq_weight_list[shape_index] = usq_weight_list[shape_index].reshape(-1, self.data_split_shape[idx])
+
+        reward = usq_reward.squeeze(dim=1)
+        advantage = usq_advantage.squeeze(dim=1)
+        if group_num > 0 and len(group_advantages) == group_num:
+            weights = torch.tensor(Config.REWARD_GROUP_ADV_WEIGHTS, dtype=advantage.dtype, device=advantage.device)
+            advantage = torch.stack(group_advantages, dim=1).matmul(weights)
+
+        frame_is_train = usq_is_train.squeeze(dim=1)
+        valid_mask = frame_is_train > 0.5
+        if Config.ADV_NORM and torch.sum(valid_mask) > 1:
+            adv_valid = advantage[valid_mask]
+            advantage = (advantage - adv_valid.mean()) / (adv_valid.std(unbiased=False) + 1e-5)
+
+        label_list = [ele.squeeze(dim=1) for ele in usq_label_list]
+        weight_list = [weight.squeeze(dim=1) for weight in usq_weight_list]
+
+        label_result = rst_list[:label_num]
+        value_result = rst_list[label_num]
+        group_value_results = rst_list[label_num + 1 : label_num + 1 + group_num]
+
+        _, split_feature_legal_action = torch.split(
             seri_vec,
             [np.prod(self.seri_vec_split_shape[0]), np.prod(self.seri_vec_split_shape[1])],
             dim=1,
         )
-        legal_action_list = torch.split(split_legal_action, self.label_size_list, dim=1)
-        label_result = rst_list[:-1]
-        value_result = rst_list[-1].squeeze(1)
+        feature_legal_action_shape = list(self.seri_vec_split_shape[1])
+        feature_legal_action_shape.insert(0, -1)
+        feature_legal_action = split_feature_legal_action.reshape(feature_legal_action_shape)
+        legal_action_flag_list = torch.split(feature_legal_action, self.label_size_list, dim=1)
 
-        valid_count = torch.maximum(frame_is_train.sum(), torch.tensor(1.0, device=device))
-        self.value_cost = 0.5 * ((value_result - reward) ** 2 * frame_is_train).sum() / valid_count
+        # Global value loss.
+        value_pred = value_result.squeeze(dim=1)
+        if Config.USE_VALUE_CLIP:
+            value_pred_clipped = old_value + torch.clamp(
+                value_pred - old_value, -Config.VALUE_CLIP_PARAM, Config.VALUE_CLIP_PARAM
+            )
+            value_loss_unclipped = torch.square(reward - value_pred)
+            value_loss_clipped = torch.square(reward - value_pred_clipped)
+            value_loss = torch.maximum(value_loss_unclipped, value_loss_clipped)
+        else:
+            value_loss = torch.square(reward - value_pred)
+        value_denom = torch.maximum(torch.sum(frame_is_train), torch.tensor(1.0, device=frame_is_train.device))
+        global_value_cost = 0.5 * torch.sum(value_loss * frame_is_train) / value_denom
 
-        self.policy_cost = torch.tensor(0.0, device=device)
-        entropy_total = torch.tensor(0.0, device=device)
-        clip_fraction_total = torch.tensor(0.0, device=device)
-        approx_kl_total = torch.tensor(0.0, device=device)
-        reinforce_heads = 0
-        eps = 1e-6
+        # Full D401 multi-critic loss: one clipped value loss per reward group.
+        group_value_cost = torch.tensor(0.0, device=seri_vec.device)
+        for g, group_value in enumerate(group_value_results):
+            group_pred = group_value.squeeze(dim=1)
+            target = group_returns[g]
+            old_group_value = old_group_values[g]
+            if Config.USE_VALUE_CLIP:
+                pred_clipped = old_group_value + torch.clamp(
+                    group_pred - old_group_value, -Config.VALUE_CLIP_PARAM, Config.VALUE_CLIP_PARAM
+                )
+                loss_unclipped = torch.square(target - group_pred)
+                loss_clipped = torch.square(target - pred_clipped)
+                loss = torch.maximum(loss_unclipped, loss_clipped)
+            else:
+                loss = torch.square(target - group_pred)
+            group_value_cost = group_value_cost + 0.5 * torch.sum(loss * frame_is_train) / value_denom
 
-        for i, reinforce in enumerate(self.is_reinforce_task_list):
-            if not reinforce:
+        self.value_cost = Config.VALUE_LOSS_COEF * global_value_cost
+        if group_num > 0:
+            self.value_cost = self.value_cost + Config.GROUP_VALUE_LOSS_COEF * group_value_cost
+
+        label_probability_list = []
+        epsilon = 1e-5
+        self.policy_cost = torch.tensor(0.0, device=seri_vec.device)
+        approx_kl_sum = torch.tensor(0.0, device=seri_vec.device)
+        clip_frac_sum = torch.tensor(0.0, device=seri_vec.device)
+        active_task_cnt = 0
+
+        for task_index in range(label_num):
+            if not self.is_reinforce_task_list[task_index]:
                 continue
-            reinforce_heads += 1
-            logits = label_result[i] + rule_bias_list[i].to(label_result[i].device)
-            legal = legal_action_list[i].float()
-            legal = torch.where(legal.sum(dim=1, keepdim=True) > 0, legal, torch.ones_like(legal))
-            masked_logits = logits.masked_fill(legal <= 0, -1e9)
-            prob = torch.softmax(masked_logits, dim=1)
-            dist = torch.distributions.Categorical(probs=prob)
+            active_task_cnt += 1
+            one_hot_actions = nn.functional.one_hot(label_list[task_index].long(), self.label_size_list[task_index])
+            boundary = torch.tensor(1e20, device=seri_vec.device)
+            legal_action_flag_list_max_mask = (1 - legal_action_flag_list[task_index]) * boundary
 
-            action = label_list[i].clamp(0, self.label_size_list[i] - 1)
-            new_logprob = dist.log_prob(action)
-            old_action_prob = (nn.functional.one_hot(action, self.label_size_list[i]).float() * old_prob_list[i]).sum(1)
-            old_logprob = torch.log(old_action_prob + eps)
+            label_logits_subtract_max = torch.clamp(
+                label_result[task_index]
+                - torch.max(label_result[task_index] - legal_action_flag_list_max_mask, dim=1, keepdim=True).values,
+                -boundary,
+                1,
+            )
+            label_exp_logits = legal_action_flag_list[task_index] * torch.exp(label_logits_subtract_max) + self.min_policy
+            label_probability = label_exp_logits / label_exp_logits.sum(1, keepdim=True)
+            label_probability_list.append(label_probability)
 
-            ratio = torch.exp(new_logprob - old_logprob).clamp(0.0, 3.0)
+            policy_p = (one_hot_actions * label_probability).sum(1)
+            policy_log_p = torch.log(policy_p + epsilon)
+            old_policy_p = (one_hot_actions * old_label_probability_list[task_index] + epsilon).sum(1)
+            old_policy_log_p = torch.log(old_policy_p)
+            log_ratio = policy_log_p - old_policy_log_p
+            ratio = torch.exp(log_ratio).clamp(0.0, 10.0)
+            clipped_ratio = ratio.clamp(1.0 - self.clip_param, 1.0 + self.clip_param)
+
             surr1 = ratio * advantage
-            surr2 = ratio.clamp(1.0 - self.clip_param, 1.0 + self.clip_param) * advantage
-            head_mask = weight_list[i].float() * frame_is_train
-            denom = torch.maximum(head_mask.sum(), torch.tensor(1.0, device=device))
-            self.policy_cost = self.policy_cost - (torch.minimum(surr1, surr2) * head_mask).sum() / denom
-            entropy_total = entropy_total + (dist.entropy() * head_mask).sum() / denom
+            surr2 = clipped_ratio * advantage
+            base_obj = torch.minimum(surr1, surr2)
+            if Config.USE_DUAL_CLIP:
+                dual_obj = torch.maximum(base_obj, Config.DUAL_CLIP_C * advantage)
+                ppo_obj = torch.where(advantage < 0, dual_obj, base_obj)
+            else:
+                ppo_obj = base_obj
+
+            denom = torch.maximum(
+                torch.sum(weight_list[task_index].float() * frame_is_train),
+                torch.tensor(1.0, device=seri_vec.device),
+            )
+            temp_policy_loss = -torch.sum(ppo_obj * weight_list[task_index].float() * frame_is_train) / denom
+            self.policy_cost = self.policy_cost + temp_policy_loss
 
             with torch.no_grad():
-                log_ratio = new_logprob - old_logprob
-                approx_kl_total = approx_kl_total + (((torch.exp(log_ratio) - 1.0) - log_ratio) * head_mask).sum() / denom
-                clip_fraction_total = clip_fraction_total + (((ratio - 1.0).abs() > self.clip_param).float() * head_mask).sum() / denom
+                approx_kl = torch.sum((old_policy_log_p - policy_log_p) * weight_list[task_index].float() * frame_is_train) / denom
+                clip_frac = torch.sum(
+                    ((torch.abs(ratio - 1.0) > self.clip_param).float())
+                    * weight_list[task_index].float()
+                    * frame_is_train
+                ) / denom
+                approx_kl_sum = approx_kl_sum + approx_kl
+                clip_frac_sum = clip_frac_sum + clip_frac
 
-        normalizer = max(1, reinforce_heads)
-        self.entropy_cost = -(entropy_total / normalizer)
-        self.approx_kl = approx_kl_total / normalizer
-        self.clip_fraction = clip_fraction_total / normalizer
-        self.loss = Config.VALUE_LOSS_COEF * self.value_cost + self.policy_cost + self.var_beta * self.entropy_cost
+        entropy_loss_list = []
+        current_entropy_loss_index = 0
+        for task_index in range(label_num):
+            if self.is_reinforce_task_list[task_index]:
+                temp_entropy_loss = -torch.sum(
+                    label_probability_list[current_entropy_loss_index]
+                    * legal_action_flag_list[task_index]
+                    * torch.log(label_probability_list[current_entropy_loss_index] + epsilon),
+                    dim=1,
+                )
+                temp_entropy_loss = -torch.sum(temp_entropy_loss * weight_list[task_index].float() * frame_is_train) / torch.maximum(
+                    torch.sum(weight_list[task_index].float() * frame_is_train),
+                    torch.tensor(1.0, device=seri_vec.device),
+                )
+                entropy_loss_list.append(temp_entropy_loss)
+                current_entropy_loss_index += 1
+            else:
+                entropy_loss_list.append(torch.tensor(0.0, device=seri_vec.device))
+
+        self.entropy_cost = torch.stack(entropy_loss_list).sum()
+        self.entropy_cost_list = entropy_loss_list
+        self.approx_kl = approx_kl_sum / max(1, active_task_cnt)
+        self.clip_fraction = clip_frac_sum / max(1, active_task_cnt)
+        self.loss = self.value_cost + self.policy_cost + self.var_beta * self.entropy_cost
+
         return self.loss, [
             self.loss,
             [self.value_cost, self.policy_cost, self.entropy_cost, self.approx_kl, self.clip_fraction],
@@ -237,3 +354,35 @@ class Model(PPOActorCriticLSTM):
     def set_eval_mode(self):
         self.lstm_time_steps = 1
         self.eval()
+
+
+def feature_vec_device(x):
+    return x.device
+
+
+def make_fc_layer(in_features: int, out_features: int, use_bias=True):
+    fc_layer = nn.Linear(in_features, out_features, bias=use_bias)
+    nn.init.orthogonal_(fc_layer.weight)
+    if use_bias:
+        nn.init.zeros_(fc_layer.bias)
+    return fc_layer
+
+
+class MLP(nn.Module):
+    def __init__(
+        self,
+        fc_feat_dim_list: List[int],
+        name: str,
+        non_linearity: nn.Module = nn.ReLU,
+        non_linearity_last: bool = False,
+    ):
+        super(MLP, self).__init__()
+        self.fc_layers = nn.Sequential()
+        for i in range(len(fc_feat_dim_list) - 1):
+            fc_layer = make_fc_layer(fc_feat_dim_list[i], fc_feat_dim_list[i + 1])
+            self.fc_layers.add_module(f"{name}_fc{i + 1}", fc_layer)
+            if i + 1 < len(fc_feat_dim_list) - 1 or non_linearity_last:
+                self.fc_layers.add_module(f"{name}_non_linear{i + 1}", non_linearity())
+
+    def forward(self, data):
+        return self.fc_layers(data)

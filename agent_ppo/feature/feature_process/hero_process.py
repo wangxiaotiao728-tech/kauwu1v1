@@ -18,7 +18,7 @@ class HeroProcess:
         self.main_camp = camp
         self.main_camp_hero_dict = {}
         self.enemy_camp_hero_dict = {}
-        self.transform_camp2_to_camp1 = self.is_red_camp(camp)
+        self.transform_camp2_to_camp1 = camp == "PLAYERCAMP_2"
         self.get_hero_config()
         self.map_feature_to_norm = self.normalizer.parse_config(self.hero_feature_config)
         self.view_dist = 15000
@@ -46,11 +46,6 @@ class HeroProcess:
                 self.feature_func_map[feature] = getattr(self, func_name)
             else:
                 raise ValueError(f"Unsupported function: {func_name}")
-
-    def is_red_camp(self, camp):
-        if isinstance(camp, str):
-            return camp.endswith("_2") or camp == "2"
-        return camp == 2
 
     def process_vec_hero(self, frame_state):
         self.generate_hero_info_list(frame_state)

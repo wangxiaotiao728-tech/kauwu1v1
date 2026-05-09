@@ -23,7 +23,7 @@ class OrganProcess:
         self.main_camp_organ_dict = {}
         self.enemy_camp_organ_dict = {}
 
-        self.transform_camp2_to_camp1 = self.is_red_camp(camp)
+        self.transform_camp2_to_camp1 = camp == "PLAYERCAMP_2"
         self.get_organ_config()
         self.map_feature_to_norm = self.normalizer.parse_config(self.organ_feature_config)
         self.view_dist = 15000
@@ -50,11 +50,6 @@ class OrganProcess:
                 self.feature_func_map[feature] = getattr(self, func_name)
             else:
                 raise ValueError(f"Unsupported function: {func_name}")
-
-    def is_red_camp(self, camp):
-        if isinstance(camp, str):
-            return camp.endswith("_2") or camp == "2"
-        return camp == 2
 
     def process_vec_organ(self, frame_state):
         self.generate_organ_info_dict(frame_state)

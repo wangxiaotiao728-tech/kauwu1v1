@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
-"""目标型 reward，禁止普通血量变化奖惩。"""
+###########################################################################
+# Copyright © 1998 - 2026 Tencent. All Rights Reserved.
+###########################################################################
+"""D401 replica reward process.
+
+This file intentionally follows the reward ideas in the provided D401 report:
+hero_hurt, total_damage, hero_damage, crit, skill_hit, no_ops, in_grass,
+under_tower_behavior, passive_skills, plus the original tower/forward baseline.
+All field access is defensive because different environment versions expose
+slightly different naming styles.
+"""
 
 import math
-import os
-from collections import deque
-
-from agent_ppo.conf.conf import CurriculumConfig, GameConfig, RuleConfig
-
-
-TOWER_SUB_TYPE = 21
+from agent_ppo.conf.conf import GameConfig
 
 
 class RewardStruct:
@@ -19,451 +23,366 @@ class RewardStruct:
         self.value = 0.0
         self.weight = m_weight
         self.min_value = -1
+        self.is_first_arrive_center = True
 
 
 def init_calc_frame_map():
     return {key: RewardStruct(weight) for key, weight in GameConfig.REWARD_WEIGHT_DICT.items()}
 
 
+def _get(obj, key, default=0):
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _get_any(obj, *keys, default=0):
+    for key in keys:
+        val = _get(obj, key, None)
+        if val is not None:
+            return val
+    actor_state = _get(obj, "actor_state", None)
+    if actor_state is not None:
+        for key in keys:
+            val = _get(actor_state, key, None)
+            if val is not None:
+                return val
+        values = _get(actor_state, "values", None)
+        if values is not None:
+            for key in keys:
+                val = _get(values, key, None)
+                if val is not None:
+                    return val
+    return default
+
+
+def _loc(actor):
+    return _get_any(actor, "location", default={"x": 0, "z": 0}) or {"x": 0, "z": 0}
+
+
+def _dist(a, b):
+    la, lb = _loc(a), _loc(b)
+    dx = float(_get(la, "x", 0)) - float(_get(lb, "x", 0))
+    dz = float(_get(la, "z", 0)) - float(_get(lb, "z", 0))
+    return math.sqrt(dx * dx + dz * dz)
+
+
+def _hp_rate(actor):
+    hp = float(_get_any(actor, "hp", default=0))
+    max_hp = max(1.0, float(_get_any(actor, "max_hp", default=1)))
+    return hp / max_hp
+
+
+def _is_alive(actor):
+    return _get_any(actor, "hp", default=0) > 0
+
+
+def _is_tower(npc):
+    return _get_any(npc, "sub_type", default=-1) == 21
+
+
+def _is_soldier(npc):
+    # Common 1v1 protocol uses NPC sub_type for soldiers; exact numeric values
+    # may vary, so treat non-tower non-monster NPCs as soldiers for reward logic.
+    sub = _get_any(npc, "sub_type", default=-1)
+    return sub not in (21, -1)
+
+
 class GameRewardManager:
     def __init__(self, main_hero_runtime_id):
         self.main_hero_player_id = main_hero_runtime_id
+        self.main_hero_camp = -1
         self.m_reward_value = {}
+        self.m_last_frame_no = -1
         self.m_cur_calc_frame_map = init_calc_frame_map()
-        self.m_last_scores = None
-        self.m_last_terminal_frame = -1
-        self.m_channel_abs_history = {
-            key: deque(maxlen=GameConfig.REWARD_DOMINANCE_WINDOW)
-            for key in GameConfig.REWARD_WEIGHT_DICT
-        }
-        self.m_total_abs_history = deque(maxlen=GameConfig.REWARD_DOMINANCE_WINDOW)
-        self.m_dynamic_scale = {key: 1.0 for key in GameConfig.REWARD_WEIGHT_DICT}
+        self.m_main_calc_frame_map = init_calc_frame_map()
+        self.m_enemy_calc_frame_map = init_calc_frame_map()
+        self.time_scale_arg = GameConfig.TIME_SCALE_ARG
+        self.m_each_level_max_exp = {}
 
     def init_max_exp_of_each_hero(self):
-        pass
+        self.m_each_level_max_exp.clear()
+        for k, v in {
+            1: 160,
+            2: 298,
+            3: 446,
+            4: 524,
+            5: 613,
+            6: 713,
+            7: 825,
+            8: 950,
+            9: 1088,
+            10: 1240,
+            11: 1406,
+            12: 1585,
+            13: 1778,
+            14: 1984,
+        }.items():
+            self.m_each_level_max_exp[k] = v
 
-    def result(self, frame_data, observation=None, terminated=False, truncated=False):
-        scores = self.frame_data_process(frame_data)
-        self.get_reward(frame_data, self.m_reward_value, scores, observation, terminated, truncated)
+    def _compose_weighted_reward_groups(self):
+        """Return weighted group rewards and scalar sum from current m_reward_value.
+
+        Each reward item value is already a delta/potential value. It is
+        multiplied by its configured scale and accumulated into its D401 reward
+        group. These group rewards are later used to compute separate GAE
+        returns for the multi-critic heads.
+        """
+        reward_groups = {name: 0.0 for name in GameConfig.REWARD_GROUPS.keys()}
+        assigned = set()
+        for group_name, keys in GameConfig.REWARD_GROUPS.items():
+            group_sum = 0.0
+            for key in keys:
+                assigned.add(key)
+                if key not in self.m_cur_calc_frame_map:
+                    continue
+                weight = self.m_cur_calc_frame_map[key].weight
+                group_sum += self.m_reward_value.get(key, 0.0) * weight
+            reward_groups[group_name] = group_sum
+
+        # Any ungrouped reward is kept in decay group by default, so no reward
+        # silently disappears if users later add an item to REWARD_WEIGHT_DICT.
+        default_group = next(iter(reward_groups.keys()), None)
+        if default_group is not None:
+            for key, reward_struct in self.m_cur_calc_frame_map.items():
+                if key in assigned:
+                    continue
+                reward_groups[default_group] += self.m_reward_value.get(key, 0.0) * reward_struct.weight
+
+        reward_sum = sum(reward_groups.values())
+        return reward_groups, reward_sum
+
+    def result(self, frame_data):
+        self.init_max_exp_of_each_hero()
+        self.frame_data_process(frame_data)
+        self.get_reward(frame_data, self.m_reward_value)
+        frame_no = frame_data.get("frame_no", 0)
+        if self.time_scale_arg > 0:
+            decay_factor = math.pow(0.6, 1.0 * frame_no / self.time_scale_arg)
+            for key in list(self.m_reward_value.keys()):
+                if key in ("reward_sum", "reward_groups") or key in GameConfig.NO_DECAY_REWARD_KEYS:
+                    continue
+                self.m_reward_value[key] *= decay_factor
+
+        reward_groups, reward_sum = self._compose_weighted_reward_groups()
+        self.m_reward_value["reward_groups"] = reward_groups
+        self.m_reward_value["reward_sum"] = reward_sum
         return self.m_reward_value
 
-    def frame_data_process(self, frame_data):
-        my_hero, enemy_hero = self._split_heroes(frame_data)
-        my_camp = (my_hero or {}).get("camp")
-        own_tower, enemy_tower, friendly_minions, enemy_minions, neutral_units = self._split_npcs(frame_data, my_camp)
-        lane_score = self._lane_score(own_tower, enemy_tower, friendly_minions, enemy_minions)
-        direct_push_window = self._direct_push_window(my_hero, enemy_hero, enemy_tower, friendly_minions)
-        defense_emergency = self._defense_emergency(own_tower, enemy_minions)
-        resource_allowed = (not direct_push_window) and (not defense_emergency) and self._hp_ratio(my_hero) > 0.45
+    def _find_main_and_enemy(self, frame_data, camp):
+        main_hero, enemy_hero = None, None
+        for hero in frame_data.get("hero_states", []):
+            if _get_any(hero, "camp", default=None) == camp:
+                main_hero = hero
+            else:
+                enemy_hero = hero
+        return main_hero, enemy_hero
 
-        return {
-            "my_hp": self._hp_ratio(my_hero),
-            "enemy_hp": self._hp_ratio(enemy_hero),
-            "own_tower_hp": self._hp_ratio(own_tower),
-            "enemy_tower_hp": self._hp_ratio(enemy_tower),
-            "my_money": self._money_value(my_hero),
-            "my_exp": (my_hero or {}).get("exp", 0),
-            "my_level": (my_hero or {}).get("level", 1),
-            "my_dead_cnt": (my_hero or {}).get("dead_cnt", 0),
-            "my_kill_cnt": (my_hero or {}).get("kill_cnt", 0),
-            "lane_score": lane_score,
-            "last_hit": self._last_hit_reward(frame_data),
-            "tower_risk": self._tower_risk(my_hero, enemy_tower),
-            "enemy_dead": 1.0 if enemy_hero and not self._alive(enemy_hero) else 0.0,
-            "enhanced_ready": self._enhanced_attack_ready(my_hero),
-            "direct_push_window": direct_push_window,
-            "defense_emergency": defense_emergency,
-            "resource_allowed": resource_allowed,
-            "neutral_taken": self._neutral_taken(frame_data),
-            "neutral_hp_sum": sum(self._hp_ratio(unit) for unit in neutral_units),
-            "neutral_attack": self._neutral_attack(my_hero, neutral_units),
-            "safe_cake_pick": self._safe_cake_pick(frame_data, my_hero, enemy_hero, enemy_tower),
-            "skill_result": self._skill_result(my_hero),
-            "skill_used": self._skill_used(my_hero),
-            "bad_resource": self._bad_resource_attempt(my_hero, neutral_units, resource_allowed),
-        }
-
-    def get_reward(self, frame_data, reward_dict, scores, observation=None, terminated=False, truncated=False):
-        reward_dict.clear()
-        terminal_items = self._terminal_items(frame_data, observation, terminated, truncated)
-        if self.m_last_scores is None:
-            reward_items = {key: 0.0 for key in self.m_cur_calc_frame_map}
-            reward_items.update(terminal_items)
-            self._write_reward(reward_dict, reward_items, self._channels(reward_items))
-            self.m_last_scores = scores
-            return
-
-        last = self.m_last_scores
-        enemy_tower_delta = max(0.0, last["enemy_tower_hp"] - scores["enemy_tower_hp"])
-        own_tower_delta = max(0.0, last["own_tower_hp"] - scores["own_tower_hp"])
-        lane_delta = scores["lane_score"] - last["lane_score"]
-        growth = max(0.0, scores["my_money"] - last["my_money"]) / 100.0
-        growth += max(0.0, scores["my_exp"] - last["my_exp"]) / 100.0
-        growth += max(0.0, scores["my_level"] - last["my_level"])
-        death_delta = max(0.0, scores["my_dead_cnt"] - last["my_dead_cnt"])
-        enemy_hp_delta = max(0.0, last.get("enemy_hp", 0.0) - scores.get("enemy_hp", 0.0))
-        neutral_hp_delta = max(0.0, last.get("neutral_hp_sum", 0.0) - scores.get("neutral_hp_sum", 0.0))
-        tower_risk_delta = max(0.0, scores["tower_risk"] - last.get("tower_risk", 0.0))
-
-        objective_scale = 1.0
-        defense_scale = 1.0
-        growth_scale = 1.0
-        resource_scale = 1.0
-        cake_scale = 1.0
-        if scores["direct_push_window"]:
-            objective_scale = 1.5
-            growth_scale = 0.3
-            resource_scale = 0.0
-            cake_scale = 0.0
-        if scores["defense_emergency"]:
-            defense_scale = 1.5
-            resource_scale = 0.0
-            growth_scale = min(growth_scale, 0.5)
-
-        stage = self._stage()
-        reward_items = {
-            "terminal_win": terminal_items["terminal_win"],
-            "terminal_lose": terminal_items["terminal_lose"],
-            "timeout": terminal_items["timeout"],
-            "enemy_tower_delta": enemy_tower_delta * objective_scale,
-            "own_tower_delta": own_tower_delta * defense_scale,
-            "lane": lane_delta,
-            "growth": growth * growth_scale,
-            "last_hit": scores["last_hit"],
-            "death": death_delta,
-            "tower_risk": (
-                GameConfig.TOWER_RISK_DELTA_COEF * tower_risk_delta
-                + GameConfig.TOWER_RISK_EXPOSURE_COEF
-                * scores["tower_risk"]
-                * self._sigmoid((RuleConfig.LOW_HP_RISK_RATIO - scores["my_hp"]) / 0.10)
-            ),
-            "enhanced_tower": enemy_tower_delta * scores["enhanced_ready"] if stage.get("enable_enhanced_tower_reward", True) else 0.0,
-            "death_window_tower_mult": enemy_tower_delta * scores["enemy_dead"] if stage.get("enable_death_window_reward", True) else 0.0,
-            "neutral_result": (
-                (scores["neutral_taken"] + neutral_hp_delta + 0.05 * scores["neutral_attack"]) * resource_scale
-                if stage.get("enable_resource_reward", False)
-                else 0.0
-            ),
-            "cake_safe_pick": scores["safe_cake_pick"] * cake_scale if stage.get("enable_cake_reward", False) else 0.0,
-            "skill_result": (
-                max(scores["skill_result"], scores["skill_used"] * enemy_hp_delta)
-                if stage.get("enable_skill_result_reward", False)
-                else 0.0
-            ),
-            "bad_resource": scores["bad_resource"] if stage.get("enable_resource_reward", False) else 0.0,
-        }
-        self._write_reward(reward_dict, reward_items, self._channels(reward_items))
-        self.m_last_scores = scores
-
-    def _write_reward(self, reward_dict, reward_items, channels):
-        reward_sum = 0.0
-        weighted_items = {}
-        for reward_name, reward_struct in self.m_cur_calc_frame_map.items():
-            reward_struct.value = reward_items.get(reward_name, 0.0)
-            weighted_value = reward_struct.value * reward_struct.weight * self.m_dynamic_scale.get(reward_name, 1.0)
-            weighted_items[reward_name] = weighted_value
-            reward_sum += weighted_value
-            reward_dict[reward_name] = reward_struct.value
-        self._update_reward_dominance(weighted_items)
-        reward_dict.update(channels)
-        reward_dict["reward_sum"] = self._clamp(reward_sum, GameConfig.REWARD_SUM_CLIP_MIN, GameConfig.REWARD_SUM_CLIP_MAX)
-
-    def _update_reward_dominance(self, weighted_items):
-        total_abs = sum(abs(value) for value in weighted_items.values())
-        self.m_total_abs_history.append(total_abs)
-        for key, value in weighted_items.items():
-            self.m_channel_abs_history[key].append(abs(value))
-        total_mean = sum(self.m_total_abs_history) / max(1, len(self.m_total_abs_history))
-        if total_mean <= 1e-6 or len(self.m_total_abs_history) < GameConfig.REWARD_DOMINANCE_WINDOW:
-            return
-        for key, history in self.m_channel_abs_history.items():
-            channel_mean = sum(history) / max(1, len(history))
-            if channel_mean / total_mean > GameConfig.REWARD_DOMINANCE_LIMIT:
-                self.m_dynamic_scale[key] = max(0.3, self.m_dynamic_scale.get(key, 1.0) * GameConfig.REWARD_AUTO_DECAY)
-
-    def _channels(self, reward_items):
-        weights = GameConfig.REWARD_WEIGHT_DICT
-        return {
-            "terminal": (
-                reward_items.get("terminal_win", 0.0) * weights["terminal_win"]
-                + reward_items.get("terminal_lose", 0.0) * weights["terminal_lose"]
-                + reward_items.get("timeout", 0.0) * weights["timeout"]
-            ),
-            "tower": reward_items.get("enemy_tower_delta", 0.0) * weights["enemy_tower_delta"],
-            "tower_defense": reward_items.get("own_tower_delta", 0.0) * weights["own_tower_delta"],
-            "lane": reward_items.get("lane", 0.0) * weights["lane"],
-            "growth": reward_items.get("growth", 0.0) * weights["growth"],
-            "last_hit": reward_items.get("last_hit", 0.0) * weights["last_hit"],
-            "enhanced_tower": reward_items.get("enhanced_tower", 0.0) * weights["enhanced_tower"],
-            "resource": reward_items.get("neutral_result", 0.0) * weights["neutral_result"],
-            "cake": reward_items.get("cake_safe_pick", 0.0) * weights["cake_safe_pick"],
-            "skill": reward_items.get("skill_result", 0.0) * weights["skill_result"],
-            "death": reward_items.get("death", 0.0) * weights["death"],
-            "tower_risk": reward_items.get("tower_risk", 0.0) * weights["tower_risk"],
-        }
-
-    def _terminal_items(self, frame_data, observation, terminated, truncated):
-        items = {"terminal_win": 0.0, "terminal_lose": 0.0, "timeout": 0.0}
-        if not terminated and not truncated:
-            return items
-        frame_no = frame_data.get("frame_no", 0)
-        if self.m_last_terminal_frame == frame_no:
-            return items
-        self.m_last_terminal_frame = frame_no
-        if truncated:
-            items["timeout"] = 1.0
-        elif observation and observation.get("win", 0):
-            items["terminal_win"] = 1.0
-        else:
-            items["terminal_lose"] = 1.0
-        return items
-
-    def _stage(self):
-        stage_name = os.environ.get("HOK_CURRICULUM_STAGE", CurriculumConfig.CURRENT_STAGE)
-        return CurriculumConfig.CURRICULUM_STAGES.get(stage_name, CurriculumConfig.CURRICULUM_STAGES["S1_BASIC"])
-
-    def _lane_score(self, own_tower, enemy_tower, friendly_minions, enemy_minions):
-        friendly_count = self._safe_div(len(friendly_minions), 8.0)
-        enemy_count = self._safe_div(len(enemy_minions), 8.0)
-        friendly_hp = self._safe_div(sum(self._hp_ratio(unit) for unit in friendly_minions), 8.0)
-        enemy_hp = self._safe_div(sum(self._hp_ratio(unit) for unit in enemy_minions), 8.0)
-        enemy_tower_pos = self._pos(enemy_tower)
-        own_tower_pos = self._pos(own_tower)
-        friendly_front = min((self._dist(self._pos(unit), enemy_tower_pos) for unit in friendly_minions), default=30000.0)
-        enemy_front = min((self._dist(self._pos(unit), own_tower_pos) for unit in enemy_minions), default=30000.0)
-        return 0.30 * (friendly_count - enemy_count) + 0.25 * (friendly_hp - enemy_hp) + 0.30 * (1.0 - self._safe_div(friendly_front, 30000.0)) - 0.15 * (1.0 - self._safe_div(enemy_front, 30000.0))
-
-    def _direct_push_window(self, my_hero, enemy_hero, enemy_tower, friendly_minions):
-        enemy_dead = enemy_hero is not None and not self._alive(enemy_hero)
-        tower_finish = enemy_tower is not None and self._hp_ratio(enemy_tower) < RuleConfig.FINISH_TOWER_HP_RATIO
-        minion_tanking = self._friendly_minion_tanking(enemy_tower, friendly_minions)
-        enhanced_can_hit = self._enhanced_attack_ready(my_hero) and self._can_attack_tower(my_hero, enemy_tower)
-        return bool(enemy_dead or tower_finish or minion_tanking or enhanced_can_hit)
-
-    def _defense_emergency(self, own_tower, enemy_minions):
-        return bool(own_tower and (self._hp_ratio(own_tower) < RuleConfig.LOW_HP_RISK_RATIO or len(enemy_minions) >= 4))
-
-    def _last_hit_reward(self, frame_data):
-        score = 0.0
-        frame_action = frame_data.get("frame_action", {}) or {}
-        for dead in frame_action.get("dead_action", []) or []:
-            killer = dead.get("killer", {}) or {}
-            death = dead.get("death", {}) or {}
-            if killer.get("runtime_id") != self.main_hero_player_id:
+    def _find_towers(self, frame_data, camp):
+        main_tower, enemy_tower = None, None
+        for npc in frame_data.get("npc_states", []):
+            if not _is_tower(npc):
                 continue
-            if death.get("actor_type") == "ACTOR_TYPE_HERO":
-                continue
-            if "TOWER" in str(death.get("sub_type", "")).upper():
-                continue
-            score += 1.0
-        return score
+            if _get_any(npc, "camp", default=None) == camp:
+                main_tower = npc
+            else:
+                enemy_tower = npc
+        return main_tower, enemy_tower
 
-    def _neutral_taken(self, frame_data):
-        score = 0.0
-        frame_action = frame_data.get("frame_action", {}) or {}
-        for dead in frame_action.get("dead_action", []) or []:
-            killer = dead.get("killer", {}) or {}
-            death = dead.get("death", {}) or {}
-            if killer.get("runtime_id") == self.main_hero_player_id and self._is_monster(death):
-                score += 1.0
-        return score
-
-    def _safe_cake_pick(self, frame_data, my_hero, enemy_hero, enemy_tower):
-        cakes = frame_data.get("cakes", []) or []
-        if not cakes or not my_hero or self._hp_ratio(my_hero) >= 0.40:
-            return 0.0
-        my_pos = self._pos(my_hero)
-        nearest = min(cakes, key=lambda item: self._dist(my_pos, self._cake_pos(item)))
-        dist = self._dist(my_pos, self._cake_pos(nearest))
-        enemy_safe = True if not enemy_hero else self._dist(self._pos(enemy_hero), self._cake_pos(nearest)) > RuleConfig.ENEMY_NEAR_DIST
-        tower_safe = self._tower_risk(my_hero, enemy_tower) < RuleConfig.BLOOD_PACK_TOWER_RISK_LIMIT
-        return 1.0 if dist < 2500 and enemy_safe and tower_safe else 0.0
-
-    def _skill_result(self, my_hero):
-        slots = (((my_hero or {}).get("skill_state") or {}).get("slot_states", []) or [])
-        return 1.0 if any(self._slot_used(slot) and self._slot_hit_hero(slot) for slot in slots) else 0.0
-
-    def _skill_used(self, my_hero):
-        slots = (((my_hero or {}).get("skill_state") or {}).get("slot_states", []) or [])
-        real_cmd = (my_hero or {}).get("real_cmd", []) or []
-        return 1.0 if any(self._slot_used(slot) for slot in slots) or self._real_cmd_has_skill(real_cmd) else 0.0
-
-    def _slot_used(self, slot):
-        return any(
-            self._positive(safe_value)
-            for safe_value in (
-                slot.get("succUsedInFrame", 0),
-                slot.get("succ_used_in_frame", 0),
-                slot.get("usedInFrame", 0),
-                slot.get("used_in_frame", 0),
-            )
-        )
-
-    def _slot_hit_hero(self, slot):
-        return any(
-            self._positive(safe_value)
-            for safe_value in (
-                slot.get("hitHeroTimes", 0),
-                slot.get("hit_hero_times", 0),
-                slot.get("hitHeroNum", 0),
-                slot.get("hit_hero_num", 0),
-                slot.get("hit_hero_cnt", 0),
-            )
-        )
-
-    def _positive(self, value):
-        try:
-            return float(value) > 0.0
-        except (TypeError, ValueError):
+    def _friendly_soldier_near_tower(self, frame_data, camp, tower):
+        if tower is None:
             return False
-
-    def _real_cmd_has_skill(self, real_cmd):
-        for cmd in real_cmd or []:
-            cmd_text = str(cmd).upper()
-            if "SKILL" in cmd_text or "SPELL" in cmd_text:
+        tower_range = float(_get_any(tower, "attack_range", default=8000) or 8000)
+        for npc in frame_data.get("npc_states", []):
+            if _get_any(npc, "camp", default=None) != camp:
+                continue
+            if _is_tower(npc):
+                continue
+            if _hp_rate(npc) <= 0:
+                continue
+            if _dist(npc, tower) <= tower_range * 1.10:
                 return True
         return False
 
-    def _bad_resource_attempt(self, my_hero, neutral_units, resource_allowed):
-        if resource_allowed or not neutral_units or not my_hero:
+    def _calc_skill_hit(self, hero):
+        skill_state = _get_any(hero, "skill_state", default={})
+        slot_states = _get(skill_state, "slot_states", []) or []
+        vals = []
+        for slot in slot_states:
+            used = float(_get_any(slot, "usedTimes", "used_times", default=0) or 0)
+            if used <= 0:
+                continue
+            hit = float(_get_any(slot, "hitHeroTimes", "hit_hero_times", default=0) or 0)
+            vals.append(hit / max(1.0, used))
+        return sum(vals) / max(1, len(slot_states)) if slot_states else 0.0
+
+    def _calc_in_grass(self, hero, enemy_hero):
+        if not bool(_get_any(hero, "is_in_grass", default=False)):
             return 0.0
-        target_id = my_hero.get("attack_target")
-        return 1.0 if target_id in {unit.get("runtime_id") for unit in neutral_units} else 0.0
-
-    def _neutral_attack(self, my_hero, neutral_units):
-        if not neutral_units or not my_hero:
-            return 0.0
-        target_id = my_hero.get("attack_target")
-        neutral_ids = {unit.get("runtime_id") for unit in neutral_units}
-        return 1.0 if target_id in neutral_ids else 0.0
-
-    def _enhanced_attack_ready(self, my_hero):
-        if not my_hero:
-            return 0.0
-        buffs = ((my_hero.get("buff_state") or {}).get("buff_skills", []) or [])
-        marks = ((my_hero.get("buff_state") or {}).get("buff_marks", []) or [])
-        return 1.0 if buffs or marks else 0.0
-
-    def _tower_risk(self, my_hero, enemy_tower):
-        if not my_hero or not enemy_tower or not self._alive(my_hero):
-            return 0.0
-        dist = self._dist(self._pos(my_hero), self._pos(enemy_tower))
-        tower_range = enemy_tower.get("attack_range", RuleConfig.DEFAULT_TOWER_RANGE)
-        smooth = self._sigmoid((tower_range - dist) / RuleConfig.TOWER_RISK_SIGMOID_SCALE)
-        target_self = 1.0 if enemy_tower.get("attack_target") == my_hero.get("runtime_id") else 0.0
-        low_hp = self._sigmoid((RuleConfig.LOW_HP_RISK_RATIO - self._hp_ratio(my_hero)) / 0.08)
-        return self._clamp(smooth * (0.35 + 0.45 * target_self + 0.20 * low_hp))
-
-    def _friendly_minion_tanking(self, tower, minions):
-        target = (tower or {}).get("attack_target")
-        return target is not None and target in {unit.get("runtime_id") for unit in minions}
-
-    def _can_attack_tower(self, my_hero, enemy_tower):
-        return bool(my_hero and enemy_tower and self._dist(self._pos(my_hero), self._pos(enemy_tower)) <= my_hero.get("attack_range", 0) + RuleConfig.ATTACK_TOWER_EXTRA_RANGE)
-
-    def _split_heroes(self, frame_data):
-        heroes = frame_data.get("hero_states", []) or []
-        my_hero, enemy_hero = None, None
-        for hero in heroes:
-            if hero.get("runtime_id") == self.main_hero_player_id:
-                my_hero = hero
-                break
-        my_camp = (my_hero or {}).get("camp")
-        for hero in heroes:
-            if hero is not my_hero and not self._same_camp(hero.get("camp"), my_camp):
-                enemy_hero = hero
-                break
-        return my_hero, enemy_hero
-
-    def _split_npcs(self, frame_data, my_camp):
-        own_tower, enemy_tower, friendly_minions, enemy_minions, neutral_units = None, None, [], [], []
-        for npc in frame_data.get("npc_states", []) or []:
-            camp = npc.get("camp")
-            if self._is_tower(npc):
-                if self._same_camp(camp, my_camp):
-                    own_tower = npc
-                else:
-                    enemy_tower = npc
-            elif self._is_monster(npc):
-                neutral_units.append(npc)
-            elif self._same_camp(camp, my_camp):
-                friendly_minions.append(npc)
-            elif camp not in (0, None, "0"):
-                enemy_minions.append(npc)
-        return own_tower, enemy_tower, friendly_minions, enemy_minions, neutral_units
-
-    def _is_tower(self, npc):
-        sub_type = npc.get("sub_type")
-        return sub_type == TOWER_SUB_TYPE or "TOWER" in str(sub_type).upper()
-
-    def _is_monster(self, npc):
-        actor_type = str(npc.get("actor_type", "")).upper()
-        sub_type = str(npc.get("sub_type", "")).upper()
-        return "MONSTER" in actor_type or "MONSTER" in sub_type or self._camp_value(npc.get("camp")) in (0, None, "0")
-
-    def _hp_ratio(self, obj):
-        return self._clamp(self._safe_div((obj or {}).get("hp", 0), self._max_hp(obj)))
-
-    def _max_hp(self, obj):
-        obj = obj or {}
-        for key in ("max_hp", "hp_max", "maxHp", "maxHP"):
-            value = obj.get(key)
-            if value:
-                return value
-        if self._is_tower(obj):
-            return RuleConfig.DEFAULT_TOWER_MAX_HP
-        if self._is_monster(obj):
-            return RuleConfig.DEFAULT_NEUTRAL_MAX_HP
-        if "HERO" in str(obj.get("actor_type", "")).upper():
-            return RuleConfig.DEFAULT_HERO_MAX_HP
-        return obj.get("hp", 0)
-
-    def _alive(self, obj):
-        return bool(obj and obj.get("hp", 0) > 0)
-
-    def _money_value(self, hero):
-        return (hero or {}).get("money_cnt", (hero or {}).get("money", 0))
-
-    def _pos(self, obj):
-        loc = (obj or {}).get("location", {}) or {}
-        return loc.get("x", 100000), loc.get("z", 100000)
-
-    def _cake_pos(self, cake):
-        loc = ((cake.get("collider", {}) or {}).get("location", {}) or {})
-        return loc.get("x", 100000), loc.get("z", 100000)
-
-    def _dist(self, a, b):
-        ax, az = a
-        bx, bz = b
-        if 100000 in (ax, az, bx, bz):
-            return 100000.0
-        return math.sqrt((ax - bx) ** 2 + (az - bz) ** 2)
-
-    def _same_camp(self, left, right):
-        return self._camp_value(left) == self._camp_value(right)
-
-    def _camp_value(self, camp):
-        if isinstance(camp, str):
-            if camp.endswith("_1") or camp == "1":
-                return 1
-            if camp.endswith("_2") or camp == "2":
-                return 2
-        return camp
-
-    def _sigmoid(self, value):
-        value = max(-30.0, min(30.0, value))
-        return 1.0 / (1.0 + math.exp(-value))
-
-    def _safe_div(self, num, den):
+        val = 0.25
+        main_visible = _get_any(hero, "camp_visible", default=[])
+        enemy_visible = _get_any(enemy_hero, "camp_visible", default=[])
         try:
-            return num / den if den else 0.0
-        except (TypeError, ZeroDivisionError):
-            return 0.0
+            main_vis_all = all(main_visible)
+            enemy_vis_all = all(enemy_visible)
+            if (not main_vis_all) and enemy_vis_all:
+                val += 0.5
+        except Exception:
+            pass
+        if enemy_hero is not None:
+            attack_range = float(_get_any(hero, "attack_range", default=0) or 0)
+            if attack_range > 0 and _dist(hero, enemy_hero) <= attack_range:
+                val += 0.5
+        return val
 
-    def _clamp(self, value, min_value=0.0, max_value=1.0):
-        try:
-            if math.isnan(value) or math.isinf(value):
-                return 0.0
-        except TypeError:
+    def _calc_under_tower_behavior(self, frame_data, hero, enemy_hero, enemy_tower, camp):
+        if hero is None or enemy_tower is None:
             return 0.0
-        return max(min_value, min(max_value, value))
+        tower_range = float(_get_any(enemy_tower, "attack_range", default=8000) or 8000)
+        in_tower_range = _dist(hero, enemy_tower) <= tower_range
+        if not in_tower_range:
+            return 0.0
+        has_ally_soldier = self._friendly_soldier_near_tower(frame_data, camp, enemy_tower)
+        reward = 0.0
+        if not has_ally_soldier:
+            reward -= 0.5
+        attack_target = _get_any(hero, "attack_target", default=-1)
+        if has_ally_soldier:
+            if attack_target == _get_any(enemy_tower, "runtime_id", default=None):
+                reward += 1.0
+            elif enemy_hero is not None and attack_target == _get_any(enemy_hero, "runtime_id", default=None):
+                reward -= 0.3
+            else:
+                for npc in frame_data.get("npc_states", []):
+                    if _get_any(npc, "camp", default=None) == camp:
+                        continue
+                    if _is_tower(npc):
+                        continue
+                    if attack_target == _get_any(npc, "runtime_id", default=None):
+                        reward += 0.2
+                        break
+        return reward
+
+    def _calc_passive_skills(self, hero):
+        passive_skills = _get_any(hero, "passive_skill", default=[]) or []
+        total_level = sum(int(_get(skill, "level", 0) or 0) for skill in passive_skills)
+        reward = total_level * 0.02
+        for skill in passive_skills:
+            if bool(_get(skill, "triggered", False)):
+                reward += 0.1 + int(_get(skill, "level", 0) or 0) * 0.02
+        if total_level >= 5:
+            reward += 0.3
+        elif total_level >= 3:
+            reward += 0.1
+        return reward
+
+    def set_cur_calc_frame_vec(self, calc_frame_map, frame_data, camp):
+        main_hero, enemy_hero = self._find_main_and_enemy(frame_data, camp)
+        main_tower, enemy_tower = self._find_towers(frame_data, camp)
+        for reward_name, reward_struct in calc_frame_map.items():
+            reward_struct.last_frame_value = reward_struct.cur_frame_value
+            if main_hero is None:
+                reward_struct.cur_frame_value = 0.0
+                continue
+            if reward_name == "tower_hp_point":
+                reward_struct.cur_frame_value = _hp_rate(main_tower)
+            elif reward_name == "hp_point":
+                reward_struct.cur_frame_value = _hp_rate(main_hero)
+            elif reward_name == "money":
+                reward_struct.cur_frame_value = float(_get_any(main_hero, "money_cnt", "money", default=0)) / 30000.0
+            elif reward_name == "exp":
+                level = int(_get_any(main_hero, "level", default=1) or 1)
+                max_exp = max(1, self.m_each_level_max_exp.get(level, 2000))
+                reward_struct.cur_frame_value = level / 15.0 + float(_get_any(main_hero, "exp", default=0)) / max_exp / 15.0
+            elif reward_name == "kill":
+                reward_struct.cur_frame_value = float(_get_any(main_hero, "kill_cnt", default=0))
+            elif reward_name == "death":
+                reward_struct.cur_frame_value = float(_get_any(main_hero, "dead_cnt", default=0))
+            elif reward_name == "ep_rate":
+                ep = float(_get_any(main_hero, "ep", default=0))
+                max_ep = max(1.0, float(_get_any(main_hero, "max_ep", default=1)))
+                reward_struct.cur_frame_value = ep / max_ep
+            elif reward_name == "last_hit":
+                # Baseline protocol does not expose an explicit last-hit event here.
+                # Use money_cnt as a weak monotonically increasing proxy.
+                reward_struct.cur_frame_value = float(_get_any(main_hero, "money_cnt", "money", default=0)) / 30000.0
+            elif reward_name == "forward":
+                reward_struct.cur_frame_value = self.calculate_forward(main_hero, main_tower, enemy_tower)
+            elif reward_name == "hero_hurt":
+                reward_struct.cur_frame_value = float(
+                    _get_any(main_hero, "total_be_hurt_by_hero", "totalBeHurtByHero", default=0)
+                ) / 2e4
+            elif reward_name == "hero_damage":
+                reward_struct.cur_frame_value = float(
+                    _get_any(main_hero, "total_hurt_to_hero", "totalHurtToHero", default=0)
+                ) / 2e4
+            elif reward_name == "total_damage":
+                reward_struct.cur_frame_value = float(_get_any(main_hero, "total_hurt", "totalHurt", default=0)) / 6e4
+            elif reward_name == "crit":
+                crit_rate = float(_get_any(main_hero, "crit_rate", default=0))
+                crit_effe = float(_get_any(main_hero, "crit_effe", default=0))
+                reward_struct.cur_frame_value = crit_rate * crit_effe / 1e4
+            elif reward_name == "skill_hit":
+                reward_struct.cur_frame_value = self._calc_skill_hit(main_hero)
+            elif reward_name == "no_ops":
+                behav = _get_any(main_hero, "behav_mode", default="")
+                reward_struct.cur_frame_value = 1.0 if str(behav) == "State_Idle" or behav == 0 else 0.0
+            elif reward_name == "in_grass":
+                reward_struct.cur_frame_value = self._calc_in_grass(main_hero, enemy_hero)
+            elif reward_name == "under_tower_behavior":
+                reward_struct.cur_frame_value = self._calc_under_tower_behavior(
+                    frame_data, main_hero, enemy_hero, enemy_tower, camp
+                )
+            elif reward_name == "passive_skills":
+                reward_struct.cur_frame_value = self._calc_passive_skills(main_hero)
+
+    def calculate_forward(self, main_hero, main_tower, enemy_tower):
+        if main_hero is None or main_tower is None or enemy_tower is None:
+            return 0.0
+        dist_hero2emy = _dist(main_hero, enemy_tower)
+        dist_main2emy = max(1.0, _dist(main_tower, enemy_tower))
+        if _hp_rate(main_hero) > 0.99 and dist_hero2emy > dist_main2emy:
+            return (dist_main2emy - dist_hero2emy) / dist_main2emy
+        return 0.0
+
+    def frame_data_process(self, frame_data):
+        main_camp, enemy_camp = -1, -1
+        for hero in frame_data.get("hero_states", []):
+            runtime_id = _get_any(hero, "runtime_id", default=None)
+            player_id = _get_any(hero, "player_id", default=None)
+            if runtime_id == self.main_hero_player_id or player_id == self.main_hero_player_id:
+                main_camp = _get_any(hero, "camp", default=-1)
+                self.main_hero_camp = main_camp
+            else:
+                enemy_camp = _get_any(hero, "camp", default=-1)
+        if main_camp == -1 and frame_data.get("hero_states"):
+            main_camp = _get_any(frame_data["hero_states"][0], "camp", default=-1)
+        if enemy_camp == -1:
+            for hero in frame_data.get("hero_states", []):
+                if _get_any(hero, "camp", default=-1) != main_camp:
+                    enemy_camp = _get_any(hero, "camp", default=-1)
+                    break
+        self.set_cur_calc_frame_vec(self.m_main_calc_frame_map, frame_data, main_camp)
+        self.set_cur_calc_frame_vec(self.m_enemy_calc_frame_map, frame_data, enemy_camp)
+
+    def get_reward(self, frame_data, reward_dict):
+        reward_dict.clear()
+        for reward_name, reward_struct in self.m_cur_calc_frame_map.items():
+            if reward_name == "forward":
+                reward_struct.value = self.m_main_calc_frame_map[reward_name].cur_frame_value
+            else:
+                reward_struct.cur_frame_value = (
+                    self.m_main_calc_frame_map[reward_name].cur_frame_value
+                    - self.m_enemy_calc_frame_map[reward_name].cur_frame_value
+                )
+                reward_struct.last_frame_value = (
+                    self.m_main_calc_frame_map[reward_name].last_frame_value
+                    - self.m_enemy_calc_frame_map[reward_name].last_frame_value
+                )
+                reward_struct.value = reward_struct.cur_frame_value - reward_struct.last_frame_value
+            reward_dict[reward_name] = reward_struct.value
+        reward_groups, reward_sum = self._compose_weighted_reward_groups()
+        reward_dict["reward_groups"] = reward_groups
+        reward_dict["reward_sum"] = reward_sum

@@ -19,7 +19,7 @@ auto_switch_monitor_side = true
 # 1. selfplay：自对弈
 # 2. common_ai：与基于规则的common_ai对战
 # 3. 自定义的模型id：与指定的模型对战，需要先将模型上传至模型管理，并且将模型ID配置在kaiwu.json中，然后在此处进行引用
-opponent_agent = "common_ai"
+opponent_agent = "selfplay"
 
 # Evaluation interval (unit: games). Type: integer, value range: integer >= 2, default: 10
 # 评估间隔(单位局)，类型整型，取值范围为大于等于2的整数，默认值10

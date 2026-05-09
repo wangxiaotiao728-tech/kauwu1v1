@@ -11,7 +11,6 @@ Author: Tencent AI Arena Authors
 import os
 import time
 import random
-import math
 from agent_ppo.feature.definition import (
     sample_process,
     build_frame,
@@ -19,17 +18,11 @@ from agent_ppo.feature.definition import (
     NONE_ACTION,
     lineup_iterator_roundrobin_camp_heroes,
 )
-from agent_ppo.conf.conf import CurriculumConfig, GameConfig
+from agent_ppo.conf.conf import GameConfig
 from tools.env_conf_manager import EnvConfManager
 from tools.model_pool_utils import get_valid_model_pool
 from tools.metrics_utils import get_training_metrics
 from common_python.utils.workflow_disaster_recovery import handle_disaster_recovery
-
-
-def cosine_schedule(start, end, progress):
-    # progress 从 0 到 1，返回 start 到 end 的平滑调度值。
-    progress = max(0.0, min(1.0, progress))
-    return end + 0.5 * (start - end) * (1 + math.cos(math.pi * progress))
 
 
 def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
@@ -87,10 +80,7 @@ class EpisodeRunner:
         self.lineup_iterator = lineup_iterator
         self.agent_num = len(agents)
         self.episode_cnt = 0
-        self.train_episode_cnt = 0
         self.last_report_monitor_time = 0
-        self.current_opponent_agent = None
-        self.common_ai_history = []
 
     def _call_init_config(self, usr_conf):
         """Call init_config on both agents to get summoner skill selections,
@@ -148,9 +138,6 @@ class EpisodeRunner:
             # 更新对局配置, 可以用长度为2的列表传入当前对局的阵容id
             lineup = next(self.lineup_iterator)
             usr_conf, is_eval, monitor_side = self.env_conf_manager.update_config(lineup)
-            self.current_opponent_agent = self._select_opponent_agent(usr_conf, is_eval)
-            self._set_usr_conf_opponent_agent(usr_conf, self.current_opponent_agent)
-            self._apply_stage_hparams()
 
             # Call init_config on agents to get summoner skill selections
             # 调用 agent 的 init_config 获取召唤师技能选择，注入 usr_conf
@@ -179,30 +166,18 @@ class EpisodeRunner:
             # Game variables
             # 对局变量
             self.episode_cnt += 1
-            if not is_eval:
-                self.train_episode_cnt += 1
             frame_no = 0
             reward_sum_list = [0] * self.agent_num
-            reward_channel_sum_list = [dict() for _ in range(self.agent_num)]
             is_train_test = os.environ.get("is_train_test", "False").lower() == "true"
-            self.logger.info(
-                f"Episode {self.episode_cnt} start, opponent_agent={self.current_opponent_agent}, "
-                f"train_episode_cnt={self.train_episode_cnt}, usr_conf is {usr_conf}"
-            )
+            self.logger.info(f"Episode {self.episode_cnt} start, usr_conf is {usr_conf}")
 
             # Reward initialization
             # 回报初始化
             for i, (do_sample, agent) in enumerate(zip(self.do_samples, self.agents)):
                 if do_sample:
-                    reward = agent.reward_manager.result(
-                        observation[str(i)]["frame_state"],
-                        observation=observation[str(i)],
-                        terminated=False,
-                        truncated=False,
-                    )
+                    reward = agent.reward_manager.result(observation[str(i)]["frame_state"])
                     observation[str(i)]["reward"] = reward
                     reward_sum_list[i] += reward["reward_sum"]
-                    self._accumulate_reward_channels(reward_channel_sum_list[i], reward)
 
             while True:
                 # Initialize the default actions. If the agent does not make a decision, env.step uses the default action.
@@ -242,15 +217,9 @@ class EpisodeRunner:
                 # 计算回报，作为当前环境状态observation的一部分
                 for i, (do_sample, agent) in enumerate(zip(self.do_samples, self.agents)):
                     if do_sample:
-                        reward = agent.reward_manager.result(
-                            observation[str(i)]["frame_state"],
-                            observation=observation[str(i)],
-                            terminated=terminated,
-                            truncated=truncated,
-                        )
+                        reward = agent.reward_manager.result(observation[str(i)]["frame_state"])
                         observation[str(i)]["reward"] = reward
                         reward_sum_list[i] += reward["reward_sum"]
-                        self._accumulate_reward_channels(reward_channel_sum_list[i], reward)
 
                 # Normal end or timeout exit, run train_test will exit early
                 # 正常结束或超时退出，运行train_test时会提前退出
@@ -272,27 +241,10 @@ class EpisodeRunner:
                     if now - self.last_report_monitor_time >= 60:
                         monitor_data = {"episode_cnt": self.episode_cnt}
                         if self.monitor:
-                            monitor_data["reward"] = round(reward_sum_list[monitor_side], 2)
-                            monitor_data.update(
-                                self._env_monitor_metrics(
-                                    observation=observation,
-                                    monitor_side=monitor_side,
-                                    frame_no=frame_no,
-                                    truncated=truncated,
-                                )
-                            )
-                            monitor_data.update(
-                                {
-                                    key: round(value, 4)
-                                    for key, value in reward_channel_sum_list[monitor_side].items()
-                                }
-                            )
-                            monitor_data.update(self._agent_monitor_metrics(self.agents[monitor_side]))
+                            if is_eval:
+                                monitor_data["reward"] = round(reward_sum_list[monitor_side], 2)
                             self.monitor.put_data({os.getpid(): monitor_data})
                             self.last_report_monitor_time = now
-
-                    if not is_eval:
-                        self._update_curriculum_history(observation, monitor_side)
 
                     # Sample process
                     # 进行样本处理，准备训练
@@ -302,7 +254,7 @@ class EpisodeRunner:
                     break
 
     def reset_agents(self, observation):
-        opponent_agent = self.current_opponent_agent or self.env_conf_manager.get_opponent_agent()
+        opponent_agent = self.env_conf_manager.get_opponent_agent()
         monitor_side = self.env_conf_manager.get_monitor_side()
         is_train_test = os.environ.get("is_train_test", "False").lower() == "true"
 
@@ -321,7 +273,7 @@ class EpisodeRunner:
             if i == monitor_side:
                 # monitor_side uses the latest model
                 # monitor_side 使用最新模型
-                agent.load_model(id="latest", load_optimizer=self._should_load_optimizer())
+                agent.load_model(id="latest")
             else:
                 if opponent_agent == "common_ai":
                     # common_ai does not need to load a model, no need to predict
@@ -350,253 +302,3 @@ class EpisodeRunner:
             # Reset agent
             # 重置agent
             agent.reset(observation[str(i)])
-
-    def _select_opponent_agent(self, usr_conf, is_eval):
-        if is_eval and CurriculumConfig.EVAL_ALWAYS_COMMON_AI:
-            return "common_ai"
-        stage = self._stage()
-        stage_opponent = stage.get("opponent")
-        if stage_opponent == "common_ai":
-            return "common_ai"
-        if stage_opponent in ("common_ai_plus_short_selfplay", "selfplay_history_pool_common_ai_eval"):
-            return self._select_stage_mixed_opponent(stage_opponent)
-        base_opponent = self._get_usr_conf_opponent_agent(usr_conf) or self.env_conf_manager.get_opponent_agent()
-        if is_eval or not CurriculumConfig.ENABLE_CURRICULUM:
-            return base_opponent
-        if self.train_episode_cnt < CurriculumConfig.COMMON_AI_WARMUP_EPISODES:
-            return "common_ai"
-        selfplay_prob = self._curriculum_selfplay_prob()
-        return "selfplay" if random.random() < selfplay_prob else "common_ai"
-
-    def _select_stage_mixed_opponent(self, stage_opponent):
-        if stage_opponent == "common_ai_plus_short_selfplay":
-            return "selfplay" if random.random() < 0.15 else "common_ai"
-        roll = random.random()
-        if roll < 0.20:
-            return "common_ai"
-        return "selfplay"
-
-    def _stage(self):
-        stage_name = os.environ.get("HOK_CURRICULUM_STAGE", CurriculumConfig.CURRENT_STAGE)
-        return CurriculumConfig.CURRICULUM_STAGES.get(stage_name, CurriculumConfig.CURRICULUM_STAGES["S1_BASIC"])
-
-    def _apply_stage_hparams(self):
-        stage = self._stage()
-        progress = min(1.0, self.train_episode_cnt / max(1, CurriculumConfig.SELFPLAY_RAMP_EPISODES))
-        lr = cosine_schedule(stage.get("lr_start", 3e-4), stage.get("lr_end", 8e-5), progress)
-        entropy_coef = cosine_schedule(stage.get("entropy_start", 0.02), stage.get("entropy_end", 0.005), progress)
-        clip_eps = cosine_schedule(stage.get("clip_start", 0.20), stage.get("clip_end", 0.12), progress)
-        for agent in self.agents:
-            if hasattr(agent, "optimizer"):
-                for group in agent.optimizer.param_groups:
-                    group["lr"] = lr
-            if hasattr(agent, "model"):
-                agent.model.var_beta = entropy_coef
-                agent.model.clip_param = clip_eps
-                agent.model.ppo_epoch = int(stage.get("ppo_epoch", 1))
-
-    def _should_load_optimizer(self):
-        # 同阶段中断恢复可设置 HOK_LOAD_OPTIMIZER=1；跨阶段课程切换保持默认 False。
-        return os.environ.get("HOK_LOAD_OPTIMIZER", "0").lower() in ("1", "true", "yes")
-
-    def _accumulate_reward_channels(self, target, reward):
-        for key in (
-            "terminal",
-            "tower",
-            "tower_defense",
-            "lane",
-            "growth",
-            "last_hit",
-            "enhanced_tower",
-            "resource",
-            "cake",
-            "skill",
-            "death",
-            "tower_risk",
-        ):
-            target[key] = target.get(key, 0.0) + float(reward.get(key, 0.0))
-
-    def _agent_monitor_metrics(self, agent):
-        hidden = getattr(agent, "lstm_hidden", None)
-        hidden_norm = 0.0 if hidden is None else float(sum(float(x) * float(x) for x in hidden) ** 0.5)
-        rule_controller = getattr(agent, "rule_controller", None)
-        feature_process = getattr(agent, "feature_processes", None)
-        optimizer = getattr(agent, "optimizer", None)
-        learning_rate = 0.0
-        if optimizer is not None and getattr(optimizer, "param_groups", None):
-            learning_rate = float(optimizer.param_groups[0].get("lr", 0.0) or 0.0)
-        return {
-            "hard_mask_rate": 0.0 if rule_controller is None else round(rule_controller.hard_mask_rate, 4),
-            "rule_bias_count": 0 if rule_controller is None else rule_controller.rule_bias_count,
-            "mask_fallback_count": 0 if rule_controller is None else rule_controller.mask_fallback_count,
-            "feature_nan_count": 0 if feature_process is None else int(getattr(feature_process, "last_feature_nan_count", 0)),
-            "hidden_norm": round(hidden_norm, 4),
-            "learning_rate": round(learning_rate, 8),
-        }
-
-    def _env_monitor_metrics(self, observation, monitor_side, frame_no, truncated):
-        obs = observation.get(str(monitor_side), {}) if isinstance(observation, dict) else {}
-        frame_state = obs.get("frame_state", {}) or {}
-        units = self._extract_monitor_units(frame_state, obs)
-        my_hero = units["my_hero"]
-        enemy_hero = units["enemy_hero"]
-        own_tower = units["own_tower"]
-        enemy_tower = units["enemy_tower"]
-        return {
-            "frame_no": int(frame_no or 0),
-            "win": 1.0 if obs.get("win", 0) else 0.0,
-            "timeout_rate": 1.0 if truncated else 0.0,
-            "my_hp": round(self._hp_value(my_hero, default=0), 2),
-            "enemy_hp": round(self._hp_value(enemy_hero, default=0), 2),
-            "own_tower_hp": round(self._hp_value(own_tower, default=0), 2),
-            "enemy_tower_hp": round(self._hp_value(enemy_tower, default=0), 2),
-            "own_tower_hp_ratio": round(self._hp_ratio(own_tower), 4),
-            "enemy_tower_hp_ratio": round(self._hp_ratio(enemy_tower), 4),
-            "kill_count": self._unit_counter(my_hero, ("kill_cnt", "kill_count", "kill_num")),
-            "death_count": self._unit_counter(my_hero, ("dead_cnt", "death_count", "dead_num")),
-            "cake_count": len(frame_state.get("cake_states", []) or frame_state.get("cakes", []) or []),
-            "neutral_count": units["neutral_count"],
-            "opponent_type": self._opponent_type_value(),
-        }
-
-    def _curriculum_selfplay_prob(self):
-        if self._common_ai_gate_passed():
-            ramp_progress = max(0, self.train_episode_cnt - CurriculumConfig.COMMON_AI_WARMUP_EPISODES)
-            ramp_ratio = min(1.0, ramp_progress / max(1, CurriculumConfig.SELFPLAY_RAMP_EPISODES))
-            return CurriculumConfig.SELFPLAY_PROB_START + (
-                CurriculumConfig.SELFPLAY_PROB_MAX - CurriculumConfig.SELFPLAY_PROB_START
-            ) * ramp_ratio
-        if self.train_episode_cnt >= CurriculumConfig.FORCE_SELFPLAY_AFTER_EPISODES:
-            return CurriculumConfig.FALLBACK_SELFPLAY_PROB
-        return 0.0
-
-    def _common_ai_gate_passed(self):
-        window = CurriculumConfig.COMMON_AI_GATE_WINDOW
-        if len(self.common_ai_history) < window:
-            return False
-        recent = self.common_ai_history[-window:]
-        avg_enemy_tower_hp = sum(item["enemy_tower_hp"] for item in recent) / window
-        avg_death = sum(item["death"] for item in recent) / window
-        return (
-            avg_enemy_tower_hp <= CurriculumConfig.COMMON_AI_GATE_ENEMY_TOWER_HP
-            and avg_death <= CurriculumConfig.COMMON_AI_GATE_DEATH
-        )
-
-    def _update_curriculum_history(self, observation, monitor_side):
-        if self.current_opponent_agent != "common_ai":
-            return
-        obs = observation.get(str(monitor_side), {}) if isinstance(observation, dict) else {}
-        frame_state = obs.get("frame_state", {}) or {}
-        my_hero, enemy_tower = self._extract_monitor_hero_and_enemy_tower(frame_state, obs)
-        if my_hero is None:
-            return
-        self.common_ai_history.append(
-            {
-                "enemy_tower_hp": self._hp_value(enemy_tower, default=12000),
-                "death": my_hero.get("dead_cnt", 0),
-                "win": obs.get("win", 0),
-            }
-        )
-        max_history = max(CurriculumConfig.COMMON_AI_GATE_WINDOW * 5, 100)
-        if len(self.common_ai_history) > max_history:
-            self.common_ai_history = self.common_ai_history[-max_history:]
-
-    def _extract_monitor_hero_and_enemy_tower(self, frame_state, obs):
-        units = self._extract_monitor_units(frame_state, obs)
-        return units["my_hero"], units["enemy_tower"]
-
-    def _extract_monitor_units(self, frame_state, obs):
-        player_id = obs.get("player_id")
-        player_camp = obs.get("player_camp", obs.get("camp"))
-        my_hero = None
-        enemy_hero = None
-        for hero in frame_state.get("hero_states", []) or []:
-            if hero.get("runtime_id") == player_id:
-                my_hero = hero
-                break
-        if my_hero is None:
-            for hero in frame_state.get("hero_states", []) or []:
-                if self._same_camp(hero.get("camp"), player_camp):
-                    my_hero = hero
-                    break
-        my_camp = my_hero.get("camp") if my_hero else player_camp
-        for hero in frame_state.get("hero_states", []) or []:
-            if not self._same_camp(hero.get("camp"), my_camp):
-                enemy_hero = hero
-                break
-        own_tower = None
-        enemy_tower = None
-        neutral_count = 0
-        for npc in frame_state.get("npc_states", []) or []:
-            if self._is_tower(npc):
-                if self._same_camp(npc.get("camp"), my_camp):
-                    own_tower = own_tower or npc
-                else:
-                    enemy_tower = enemy_tower or npc
-            elif self._is_monster(npc):
-                neutral_count += 1
-        return {
-            "my_hero": my_hero,
-            "enemy_hero": enemy_hero,
-            "own_tower": own_tower,
-            "enemy_tower": enemy_tower,
-            "neutral_count": neutral_count,
-        }
-
-    def _get_usr_conf_opponent_agent(self, usr_conf):
-        try:
-            return usr_conf.get("episode", {}).get("opponent_agent")
-        except AttributeError:
-            return None
-
-    def _set_usr_conf_opponent_agent(self, usr_conf, opponent_agent):
-        if isinstance(usr_conf, dict):
-            usr_conf.setdefault("episode", {})["opponent_agent"] = opponent_agent
-
-    def _is_tower(self, npc):
-        sub_type = npc.get("sub_type")
-        return sub_type == 21 or "TOWER" in str(sub_type).upper()
-
-    def _is_monster(self, npc):
-        sub_type = str(npc.get("sub_type", "")).upper()
-        npc_type = str(npc.get("type", npc.get("npc_type", ""))).upper()
-        camp = self._camp_value(npc.get("camp"))
-        return camp not in (1, 2) and ("MONSTER" in sub_type or "MONSTER" in npc_type or npc.get("camp") in (0, "0"))
-
-    def _hp_value(self, obj, default=0):
-        if not obj:
-            return default
-        return obj.get("hp", default)
-
-    def _hp_ratio(self, obj):
-        if not obj:
-            return 0.0
-        hp = float(obj.get("hp", 0.0) or 0.0)
-        max_hp = float(obj.get("max_hp", obj.get("hp_max", hp)) or hp or 1.0)
-        return hp / max(max_hp, 1.0)
-
-    def _unit_counter(self, unit, keys):
-        if not unit:
-            return 0
-        for key in keys:
-            if key in unit:
-                return int(unit.get(key) or 0)
-        return 0
-
-    def _opponent_type_value(self):
-        if self.current_opponent_agent == "common_ai":
-            return 0
-        if self.current_opponent_agent == "selfplay":
-            return 1
-        return 2
-
-    def _same_camp(self, left, right):
-        return self._camp_value(left) == self._camp_value(right)
-
-    def _camp_value(self, camp):
-        if isinstance(camp, str):
-            if camp.endswith("_1") or camp == "1":
-                return 1
-            if camp.endswith("_2") or camp == "2":
-                return 2
-        return camp
