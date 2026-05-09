@@ -82,6 +82,45 @@ class EpisodeRunner:
         self.episode_cnt = 0
         self.last_report_monitor_time = 0
 
+    @staticmethod
+    def _safe_float(value):
+        """Convert a reward/monitor value to float safely."""
+        try:
+            if value is None:
+                return 0.0
+            if isinstance(value, bool):
+                return 1.0 if value else 0.0
+            if hasattr(value, "item"):
+                return float(value.item())
+            if isinstance(value, (list, tuple)):
+                return float(value[0]) if len(value) > 0 else 0.0
+            return float(value)
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _get_d401_monitor_keys():
+        """D401 reward keys. Must match reward_process.py and monitor_builder.py."""
+        return [
+            "hero_hurt",
+            "total_damage",
+            "hero_damage",
+            "crit",
+            "skill_hit",
+            "no_ops",
+            "in_grass",
+            "under_tower_behavior",
+            "passive_skills",
+        ]
+
+    @classmethod
+    def _accumulate_reward_items(cls, acc_dict, reward_dict):
+        """Accumulate D401 reward items over one episode."""
+        if not isinstance(reward_dict, dict):
+            return
+        for key in cls._get_d401_monitor_keys():
+            acc_dict[key] = acc_dict.get(key, 0.0) + cls._safe_float(reward_dict.get(key, 0.0))
+
     def _call_init_config(self, usr_conf):
         """Call init_config on both agents to get summoner skill selections,
         then inject the results into usr_conf.
@@ -168,6 +207,7 @@ class EpisodeRunner:
             self.episode_cnt += 1
             frame_no = 0
             reward_sum_list = [0] * self.agent_num
+            reward_item_sum_list = [dict() for _ in range(self.agent_num)]
             is_train_test = os.environ.get("is_train_test", "False").lower() == "true"
             self.logger.info(f"Episode {self.episode_cnt} start, usr_conf is {usr_conf}")
 
@@ -177,7 +217,8 @@ class EpisodeRunner:
                 if do_sample:
                     reward = agent.reward_manager.result(observation[str(i)]["frame_state"])
                     observation[str(i)]["reward"] = reward
-                    reward_sum_list[i] += reward["reward_sum"]
+                    reward_sum_list[i] += reward.get("reward_sum", 0.0)
+                    self._accumulate_reward_items(reward_item_sum_list[i], reward)
 
             while True:
                 # Initialize the default actions. If the agent does not make a decision, env.step uses the default action.
@@ -219,7 +260,8 @@ class EpisodeRunner:
                     if do_sample:
                         reward = agent.reward_manager.result(observation[str(i)]["frame_state"])
                         observation[str(i)]["reward"] = reward
-                        reward_sum_list[i] += reward["reward_sum"]
+                        reward_sum_list[i] += reward.get("reward_sum", 0.0)
+                        self._accumulate_reward_items(reward_item_sum_list[i], reward)
 
                 # Normal end or timeout exit, run train_test will exit early
                 # 正常结束或超时退出，运行train_test时会提前退出
@@ -239,10 +281,18 @@ class EpisodeRunner:
 
                     now = time.time()
                     if now - self.last_report_monitor_time >= 60:
-                        monitor_data = {"episode_cnt": self.episode_cnt}
                         if self.monitor:
-                            if is_eval:
-                                monitor_data["reward"] = round(reward_sum_list[monitor_side], 2)
+                            monitor_data = {
+                                "episode_cnt": int(self.episode_cnt),
+                                # Report reward for both training and eval episodes.
+                                "reward": round(float(reward_sum_list[monitor_side]), 4),
+                            }
+
+                            # Report whole-episode accumulated D401 reward items.
+                            side_reward_items = reward_item_sum_list[monitor_side]
+                            for key in self._get_d401_monitor_keys():
+                                monitor_data[key] = round(float(side_reward_items.get(key, 0.0)), 4)
+
                             self.monitor.put_data({os.getpid(): monitor_data})
                             self.last_report_monitor_time = now
 
