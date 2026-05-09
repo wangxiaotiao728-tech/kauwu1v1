@@ -272,8 +272,15 @@ class EpisodeRunner:
                     if now - self.last_report_monitor_time >= 60:
                         monitor_data = {"episode_cnt": self.episode_cnt}
                         if self.monitor:
-                            if is_eval:
-                                monitor_data["reward"] = round(reward_sum_list[monitor_side], 2)
+                            monitor_data["reward"] = round(reward_sum_list[monitor_side], 2)
+                            monitor_data.update(
+                                self._env_monitor_metrics(
+                                    observation=observation,
+                                    monitor_side=monitor_side,
+                                    frame_no=frame_no,
+                                    truncated=truncated,
+                                )
+                            )
                             monitor_data.update(
                                 {
                                     key: round(value, 4)
@@ -413,11 +420,43 @@ class EpisodeRunner:
         hidden = getattr(agent, "lstm_hidden", None)
         hidden_norm = 0.0 if hidden is None else float(sum(float(x) * float(x) for x in hidden) ** 0.5)
         rule_controller = getattr(agent, "rule_controller", None)
+        feature_process = getattr(agent, "feature_processes", None)
+        optimizer = getattr(agent, "optimizer", None)
+        learning_rate = 0.0
+        if optimizer is not None and getattr(optimizer, "param_groups", None):
+            learning_rate = float(optimizer.param_groups[0].get("lr", 0.0) or 0.0)
         return {
             "hard_mask_rate": 0.0 if rule_controller is None else round(rule_controller.hard_mask_rate, 4),
             "rule_bias_count": 0 if rule_controller is None else rule_controller.rule_bias_count,
-            "feature_nan_count": 0,
+            "mask_fallback_count": 0 if rule_controller is None else rule_controller.mask_fallback_count,
+            "feature_nan_count": 0 if feature_process is None else int(getattr(feature_process, "last_feature_nan_count", 0)),
             "hidden_norm": round(hidden_norm, 4),
+            "learning_rate": round(learning_rate, 8),
+        }
+
+    def _env_monitor_metrics(self, observation, monitor_side, frame_no, truncated):
+        obs = observation.get(str(monitor_side), {}) if isinstance(observation, dict) else {}
+        frame_state = obs.get("frame_state", {}) or {}
+        units = self._extract_monitor_units(frame_state, obs)
+        my_hero = units["my_hero"]
+        enemy_hero = units["enemy_hero"]
+        own_tower = units["own_tower"]
+        enemy_tower = units["enemy_tower"]
+        return {
+            "frame_no": int(frame_no or 0),
+            "win": 1.0 if obs.get("win", 0) else 0.0,
+            "timeout_rate": 1.0 if truncated else 0.0,
+            "my_hp": round(self._hp_value(my_hero, default=0), 2),
+            "enemy_hp": round(self._hp_value(enemy_hero, default=0), 2),
+            "own_tower_hp": round(self._hp_value(own_tower, default=0), 2),
+            "enemy_tower_hp": round(self._hp_value(enemy_tower, default=0), 2),
+            "own_tower_hp_ratio": round(self._hp_ratio(own_tower), 4),
+            "enemy_tower_hp_ratio": round(self._hp_ratio(enemy_tower), 4),
+            "kill_count": self._unit_counter(my_hero, ("kill_cnt", "kill_count", "kill_num")),
+            "death_count": self._unit_counter(my_hero, ("dead_cnt", "death_count", "dead_num")),
+            "cake_count": len(frame_state.get("cake_states", []) or frame_state.get("cakes", []) or []),
+            "neutral_count": units["neutral_count"],
+            "opponent_type": self._opponent_type_value(),
         }
 
     def _curriculum_selfplay_prob(self):
@@ -463,9 +502,14 @@ class EpisodeRunner:
             self.common_ai_history = self.common_ai_history[-max_history:]
 
     def _extract_monitor_hero_and_enemy_tower(self, frame_state, obs):
+        units = self._extract_monitor_units(frame_state, obs)
+        return units["my_hero"], units["enemy_tower"]
+
+    def _extract_monitor_units(self, frame_state, obs):
         player_id = obs.get("player_id")
         player_camp = obs.get("player_camp", obs.get("camp"))
         my_hero = None
+        enemy_hero = None
         for hero in frame_state.get("hero_states", []) or []:
             if hero.get("runtime_id") == player_id:
                 my_hero = hero
@@ -476,12 +520,28 @@ class EpisodeRunner:
                     my_hero = hero
                     break
         my_camp = my_hero.get("camp") if my_hero else player_camp
-        enemy_tower = None
-        for npc in frame_state.get("npc_states", []) or []:
-            if self._is_tower(npc) and not self._same_camp(npc.get("camp"), my_camp):
-                enemy_tower = npc
+        for hero in frame_state.get("hero_states", []) or []:
+            if not self._same_camp(hero.get("camp"), my_camp):
+                enemy_hero = hero
                 break
-        return my_hero, enemy_tower
+        own_tower = None
+        enemy_tower = None
+        neutral_count = 0
+        for npc in frame_state.get("npc_states", []) or []:
+            if self._is_tower(npc):
+                if self._same_camp(npc.get("camp"), my_camp):
+                    own_tower = own_tower or npc
+                else:
+                    enemy_tower = enemy_tower or npc
+            elif self._is_monster(npc):
+                neutral_count += 1
+        return {
+            "my_hero": my_hero,
+            "enemy_hero": enemy_hero,
+            "own_tower": own_tower,
+            "enemy_tower": enemy_tower,
+            "neutral_count": neutral_count,
+        }
 
     def _get_usr_conf_opponent_agent(self, usr_conf):
         try:
@@ -497,10 +557,38 @@ class EpisodeRunner:
         sub_type = npc.get("sub_type")
         return sub_type == 21 or "TOWER" in str(sub_type).upper()
 
+    def _is_monster(self, npc):
+        sub_type = str(npc.get("sub_type", "")).upper()
+        npc_type = str(npc.get("type", npc.get("npc_type", ""))).upper()
+        camp = self._camp_value(npc.get("camp"))
+        return camp not in (1, 2) and ("MONSTER" in sub_type or "MONSTER" in npc_type or npc.get("camp") in (0, "0"))
+
     def _hp_value(self, obj, default=0):
         if not obj:
             return default
         return obj.get("hp", default)
+
+    def _hp_ratio(self, obj):
+        if not obj:
+            return 0.0
+        hp = float(obj.get("hp", 0.0) or 0.0)
+        max_hp = float(obj.get("max_hp", obj.get("hp_max", hp)) or hp or 1.0)
+        return hp / max(max_hp, 1.0)
+
+    def _unit_counter(self, unit, keys):
+        if not unit:
+            return 0
+        for key in keys:
+            if key in unit:
+                return int(unit.get(key) or 0)
+        return 0
+
+    def _opponent_type_value(self):
+        if self.current_opponent_agent == "common_ai":
+            return 0
+        if self.current_opponent_agent == "selfplay":
+            return 1
+        return 2
 
     def _same_camp(self, left, right):
         return self._camp_value(left) == self._camp_value(right)

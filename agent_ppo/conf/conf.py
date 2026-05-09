@@ -80,6 +80,11 @@ class GameConfig:
     REWARD_SUM_CLIP_MIN = -10.0
     REWARD_SUM_CLIP_MAX = 10.0
 
+    # 塔下风险奖励的原始值缩放。塔下风险是高频信号，不能按每帧 1.0 直接乘权重，
+    # 否则总奖励会被持续负奖励压垮。上升项惩罚风险突然变高，暴露项只给很小持续压力。
+    TOWER_RISK_DELTA_COEF = 1.0
+    TOWER_RISK_EXPOSURE_COEF = 0.02
+
     # reward 通道占比统计窗口；用于发现某个通道长期支配总奖励。
     REWARD_DOMINANCE_WINDOW = 200
 
@@ -151,6 +156,36 @@ class RuleConfig:
 
     # fallback 动作，所有 head 被屏蔽时回退到 noop。
     NOOP_ACTION = [0, 15, 15, 15, 15, 0]
+
+    # 推塔/窗口期规则偏置动作，表示 button/move_x/move_z/skill_x/skill_z/target。
+    FINISH_TOWER_ACTION = [3, 15, 15, 15, 15, 7]
+
+    # 低血量塔下风险时禁止继续进攻的 button 列表。
+    RETREAT_FORBID_BUTTONS = (3, 4, 5, 6, 8)
+
+    # 防守、撤退、血包和资源规则默认偏置到的 button。
+    DEFEND_BUTTON = 2
+    RETREAT_BUTTON = 2
+    CAKE_BUTTON = 2
+    RESOURCE_BUTTON = 3
+
+    # 环境缺失 max_hp/hp_max 时使用的默认满血值，用于塔血、英雄血和资源血量归一化。
+    DEFAULT_TOWER_MAX_HP = 12000
+    DEFAULT_HERO_MAX_HP = 10000
+    DEFAULT_NEUTRAL_MAX_HP = 10000
+
+    # 规则偏置强度：越大越强，但仍保留 PPO 概率采样空间。
+    FINISH_TOWER_BIAS = 2.0
+    DIRECT_PUSH_BIAS = 1.2
+    DEFEND_TOWER_BIAS = 0.8
+    PICK_CAKE_BIAS = 0.5
+    CONTEST_RESOURCE_BIAS = 0.4
+    RETREAT_TOWER_BIAS = 1.0
+
+    # 规则从 512 特征中读取的风险/资源位置，必须和 feature_schema.py 保持一致。
+    TOWER_RISK_FEATURE_INDEX = 488
+    NEUTRAL_SAFE_FEATURE_INDEX = 383
+    TOWER_RISK_HARD_MASK_THRESHOLD = 0.65
 
 
 class CurriculumConfig:
@@ -225,6 +260,9 @@ class CurriculumConfig:
         },
         "S3_MECHANISM": {
             "opponent": "common_ai_plus_short_selfplay",
+            "enable_rule_bias": True,  # 开启塔窗口、血包等机制规则偏置
+            "enable_cake_bias": True,  # 低血量且安全时给拾取血包动作加偏置
+            "enable_resource_bias": False,  # S3 只学习资源奖励，不强推资源争夺规则
             "enable_resource_reward": True,
             "enable_skill_result_reward": True,
             "enable_cake_reward": True,
@@ -238,6 +276,8 @@ class CurriculumConfig:
         },
         "S4_GENERALIZATION": {
             "opponent": "selfplay_history_pool_common_ai_eval",
+            "enable_rule_bias": True,  # 泛化阶段保留规则偏置，但主要依赖模型决策
+            "enable_cake_bias": True,  # 保留安全血包偏置
             "enable_opponent_behavior": True,
             "enable_resource_bias": True,
             "lr_start": 1.2e-4,

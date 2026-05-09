@@ -9,6 +9,7 @@ from agent_ppo.feature.cake_rune_explorer import CakeRuneExplorer
 from agent_ppo.feature.neutral_objective import NeutralObjectiveMemory
 from agent_ppo.feature.opponent_behavior_memory import OpponentBehaviorMemory
 from agent_ppo.feature.tower_range_explorer import TowerRangeExplorer
+from agent_ppo.conf.conf import RuleConfig
 
 
 class MemoryProcess:
@@ -361,7 +362,21 @@ class MemoryProcess:
         return any(cmd.get("attack_common") or cmd.get("attack_actor") for cmd in real_cmd)
 
     def _hp_ratio(self, obj):
-        return self._clamp(self._safe_div((obj or {}).get("hp", 0), (obj or {}).get("max_hp", 0)))
+        return self._clamp(self._safe_div((obj or {}).get("hp", 0), self._max_hp(obj)))
+
+    def _max_hp(self, obj):
+        obj = obj or {}
+        for key in ("max_hp", "hp_max", "maxHp", "maxHP"):
+            value = obj.get(key)
+            if value:
+                return value
+        if self._is_tower(obj):
+            return RuleConfig.DEFAULT_TOWER_MAX_HP
+        if self._is_monster(obj):
+            return RuleConfig.DEFAULT_NEUTRAL_MAX_HP
+        if "HERO" in str(obj.get("actor_type", "")).upper():
+            return RuleConfig.DEFAULT_HERO_MAX_HP
+        return obj.get("hp", 0)
 
     def _pos(self, obj):
         loc = (obj or {}).get("location", {}) or {}

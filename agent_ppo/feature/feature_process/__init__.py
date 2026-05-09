@@ -65,6 +65,7 @@ class FeatureBuilder:
         self._fill_rule_debug(feature, direct_push_window, defense_emergency, resource_allowed, legal_action)
 
         feature[496:512] = 0.0
+        feature_nan_count = int(np.size(feature) - np.isfinite(feature).sum())
         feature = np.nan_to_num(feature, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
         aux = {
             "direct_push_window": direct_push_window,
@@ -76,6 +77,7 @@ class FeatureBuilder:
             "enemy_observed": enemy_hero is not None,
             "cake_observed": len(cakes) > 0,
             "neutral_observed": len(neutral_units) > 0,
+            "feature_nan_count": feature_nan_count,
         }
         return feature, aux
 
@@ -390,7 +392,21 @@ class FeatureBuilder:
         return self._dist(self._pos(my_hero), self._pos(enemy_tower)) <= safe_float(my_hero.get("attack_range", 0)) + RuleConfig.ATTACK_TOWER_EXTRA_RANGE
 
     def _hp_ratio(self, obj):
-        return float(np.clip(safe_float((obj or {}).get("hp", 0)) / (safe_float((obj or {}).get("max_hp", 0)) + 1e-6), 0.0, 1.0))
+        return float(np.clip(safe_float((obj or {}).get("hp", 0)) / (self._max_hp(obj) + 1e-6), 0.0, 1.0))
+
+    def _max_hp(self, obj):
+        obj = obj or {}
+        for key in ("max_hp", "hp_max", "maxHp", "maxHP"):
+            value = safe_float(obj.get(key, 0))
+            if value > 0:
+                return value
+        if self._is_tower(obj):
+            return RuleConfig.DEFAULT_TOWER_MAX_HP
+        if self._is_monster(obj):
+            return RuleConfig.DEFAULT_NEUTRAL_MAX_HP
+        if "HERO" in str(obj.get("actor_type", "")).upper():
+            return RuleConfig.DEFAULT_HERO_MAX_HP
+        return max(0.0, safe_float(obj.get("hp", 0)))
 
     def _alive(self, obj):
         return bool(obj and safe_float(obj.get("hp", 0)) > 0)
@@ -431,11 +447,13 @@ class FeatureProcess:
         self.memory = MemoryProcess()
         self.builder = FeatureBuilder(self.memory, Config)
         self.last_aux = {}
+        self.last_feature_nan_count = 0
 
     def reset(self, camp):
         self.camp = camp
         self.memory.reset()
         self.last_aux = {}
+        self.last_feature_nan_count = 0
 
     def process_feature(self, observation):
         frame_state = observation.get("frame_state", {}) or {}
@@ -448,6 +466,7 @@ class FeatureProcess:
             sub_action_mask=observation.get("sub_action_mask"),
         )
         self.last_aux = aux
+        self.last_feature_nan_count = int(aux.get("feature_nan_count", 0))
         return feature
 
     def update_after_action(self, observation, action, reward_aux=None):

@@ -58,6 +58,7 @@ class GameRewardManager:
 
         return {
             "my_hp": self._hp_ratio(my_hero),
+            "enemy_hp": self._hp_ratio(enemy_hero),
             "own_tower_hp": self._hp_ratio(own_tower),
             "enemy_tower_hp": self._hp_ratio(enemy_tower),
             "my_money": self._money_value(my_hero),
@@ -74,8 +75,11 @@ class GameRewardManager:
             "defense_emergency": defense_emergency,
             "resource_allowed": resource_allowed,
             "neutral_taken": self._neutral_taken(frame_data),
+            "neutral_hp_sum": sum(self._hp_ratio(unit) for unit in neutral_units),
+            "neutral_attack": self._neutral_attack(my_hero, neutral_units),
             "safe_cake_pick": self._safe_cake_pick(frame_data, my_hero, enemy_hero, enemy_tower),
             "skill_result": self._skill_result(my_hero),
+            "skill_used": self._skill_used(my_hero),
             "bad_resource": self._bad_resource_attempt(my_hero, neutral_units, resource_allowed),
         }
 
@@ -97,6 +101,9 @@ class GameRewardManager:
         growth += max(0.0, scores["my_exp"] - last["my_exp"]) / 100.0
         growth += max(0.0, scores["my_level"] - last["my_level"])
         death_delta = max(0.0, scores["my_dead_cnt"] - last["my_dead_cnt"])
+        enemy_hp_delta = max(0.0, last.get("enemy_hp", 0.0) - scores.get("enemy_hp", 0.0))
+        neutral_hp_delta = max(0.0, last.get("neutral_hp_sum", 0.0) - scores.get("neutral_hp_sum", 0.0))
+        tower_risk_delta = max(0.0, scores["tower_risk"] - last.get("tower_risk", 0.0))
 
         objective_scale = 1.0
         defense_scale = 1.0
@@ -124,12 +131,25 @@ class GameRewardManager:
             "growth": growth * growth_scale,
             "last_hit": scores["last_hit"],
             "death": death_delta,
-            "tower_risk": scores["tower_risk"] * self._sigmoid((RuleConfig.LOW_HP_RISK_RATIO - scores["my_hp"]) / 0.10),
+            "tower_risk": (
+                GameConfig.TOWER_RISK_DELTA_COEF * tower_risk_delta
+                + GameConfig.TOWER_RISK_EXPOSURE_COEF
+                * scores["tower_risk"]
+                * self._sigmoid((RuleConfig.LOW_HP_RISK_RATIO - scores["my_hp"]) / 0.10)
+            ),
             "enhanced_tower": enemy_tower_delta * scores["enhanced_ready"] if stage.get("enable_enhanced_tower_reward", True) else 0.0,
             "death_window_tower_mult": enemy_tower_delta * scores["enemy_dead"] if stage.get("enable_death_window_reward", True) else 0.0,
-            "neutral_result": scores["neutral_taken"] * resource_scale if stage.get("enable_resource_reward", False) else 0.0,
+            "neutral_result": (
+                (scores["neutral_taken"] + neutral_hp_delta + 0.05 * scores["neutral_attack"]) * resource_scale
+                if stage.get("enable_resource_reward", False)
+                else 0.0
+            ),
             "cake_safe_pick": scores["safe_cake_pick"] * cake_scale if stage.get("enable_cake_reward", False) else 0.0,
-            "skill_result": scores["skill_result"] if stage.get("enable_skill_result_reward", False) else 0.0,
+            "skill_result": (
+                max(scores["skill_result"], scores["skill_used"] * enemy_hp_delta)
+                if stage.get("enable_skill_result_reward", False)
+                else 0.0
+            ),
             "bad_resource": scores["bad_resource"] if stage.get("enable_resource_reward", False) else 0.0,
         }
         self._write_reward(reward_dict, reward_items, self._channels(reward_items))
@@ -164,7 +184,11 @@ class GameRewardManager:
     def _channels(self, reward_items):
         weights = GameConfig.REWARD_WEIGHT_DICT
         return {
-            "terminal": reward_items.get("terminal_win", 0.0) * weights["terminal_win"] + reward_items.get("terminal_lose", 0.0) * weights["terminal_lose"],
+            "terminal": (
+                reward_items.get("terminal_win", 0.0) * weights["terminal_win"]
+                + reward_items.get("terminal_lose", 0.0) * weights["terminal_lose"]
+                + reward_items.get("timeout", 0.0) * weights["timeout"]
+            ),
             "tower": reward_items.get("enemy_tower_delta", 0.0) * weights["enemy_tower_delta"],
             "tower_defense": reward_items.get("own_tower_delta", 0.0) * weights["own_tower_delta"],
             "lane": reward_items.get("lane", 0.0) * weights["lane"],
@@ -257,13 +281,61 @@ class GameRewardManager:
 
     def _skill_result(self, my_hero):
         slots = (((my_hero or {}).get("skill_state") or {}).get("slot_states", []) or [])
-        return 1.0 if any(slot.get("succUsedInFrame", 0) > 0 and slot.get("hitHeroTimes", 0) > 0 for slot in slots) else 0.0
+        return 1.0 if any(self._slot_used(slot) and self._slot_hit_hero(slot) for slot in slots) else 0.0
+
+    def _skill_used(self, my_hero):
+        slots = (((my_hero or {}).get("skill_state") or {}).get("slot_states", []) or [])
+        real_cmd = (my_hero or {}).get("real_cmd", []) or []
+        return 1.0 if any(self._slot_used(slot) for slot in slots) or self._real_cmd_has_skill(real_cmd) else 0.0
+
+    def _slot_used(self, slot):
+        return any(
+            self._positive(safe_value)
+            for safe_value in (
+                slot.get("succUsedInFrame", 0),
+                slot.get("succ_used_in_frame", 0),
+                slot.get("usedInFrame", 0),
+                slot.get("used_in_frame", 0),
+            )
+        )
+
+    def _slot_hit_hero(self, slot):
+        return any(
+            self._positive(safe_value)
+            for safe_value in (
+                slot.get("hitHeroTimes", 0),
+                slot.get("hit_hero_times", 0),
+                slot.get("hitHeroNum", 0),
+                slot.get("hit_hero_num", 0),
+                slot.get("hit_hero_cnt", 0),
+            )
+        )
+
+    def _positive(self, value):
+        try:
+            return float(value) > 0.0
+        except (TypeError, ValueError):
+            return False
+
+    def _real_cmd_has_skill(self, real_cmd):
+        for cmd in real_cmd or []:
+            cmd_text = str(cmd).upper()
+            if "SKILL" in cmd_text or "SPELL" in cmd_text:
+                return True
+        return False
 
     def _bad_resource_attempt(self, my_hero, neutral_units, resource_allowed):
         if resource_allowed or not neutral_units or not my_hero:
             return 0.0
         target_id = my_hero.get("attack_target")
         return 1.0 if target_id in {unit.get("runtime_id") for unit in neutral_units} else 0.0
+
+    def _neutral_attack(self, my_hero, neutral_units):
+        if not neutral_units or not my_hero:
+            return 0.0
+        target_id = my_hero.get("attack_target")
+        neutral_ids = {unit.get("runtime_id") for unit in neutral_units}
+        return 1.0 if target_id in neutral_ids else 0.0
 
     def _enhanced_attack_ready(self, my_hero):
         if not my_hero:
@@ -330,7 +402,21 @@ class GameRewardManager:
         return "MONSTER" in actor_type or "MONSTER" in sub_type or self._camp_value(npc.get("camp")) in (0, None, "0")
 
     def _hp_ratio(self, obj):
-        return self._clamp(self._safe_div((obj or {}).get("hp", 0), (obj or {}).get("max_hp", 0)))
+        return self._clamp(self._safe_div((obj or {}).get("hp", 0), self._max_hp(obj)))
+
+    def _max_hp(self, obj):
+        obj = obj or {}
+        for key in ("max_hp", "hp_max", "maxHp", "maxHP"):
+            value = obj.get(key)
+            if value:
+                return value
+        if self._is_tower(obj):
+            return RuleConfig.DEFAULT_TOWER_MAX_HP
+        if self._is_monster(obj):
+            return RuleConfig.DEFAULT_NEUTRAL_MAX_HP
+        if "HERO" in str(obj.get("actor_type", "")).upper():
+            return RuleConfig.DEFAULT_HERO_MAX_HP
+        return obj.get("hp", 0)
 
     def _alive(self, obj):
         return bool(obj and obj.get("hp", 0) > 0)

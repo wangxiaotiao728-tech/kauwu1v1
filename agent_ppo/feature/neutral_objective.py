@@ -4,6 +4,8 @@
 
 import math
 
+from agent_ppo.conf.conf import RuleConfig
+
 
 class NeutralObjectiveMemory:
     def __init__(self):
@@ -83,7 +85,15 @@ class NeutralObjectiveMemory:
         return dict(self.last_export)
 
     def _hp_ratio(self, obj):
-        return max(0.0, min(1.0, (obj or {}).get("hp", 0) / max(1.0, (obj or {}).get("max_hp", 1))))
+        obj = obj or {}
+        max_hp = 0
+        for key in ("max_hp", "hp_max", "maxHp", "maxHP"):
+            if obj.get(key):
+                max_hp = obj.get(key)
+                break
+        if not max_hp:
+            max_hp = RuleConfig.DEFAULT_NEUTRAL_MAX_HP
+        return max(0.0, min(1.0, obj.get("hp", 0) / max(1.0, max_hp)))
 
     def _pos(self, obj):
         loc = (obj or {}).get("location", {}) or {}
