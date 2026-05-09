@@ -80,6 +80,15 @@ class GameConfig:
     REWARD_SUM_CLIP_MIN = -10.0
     REWARD_SUM_CLIP_MAX = 10.0
 
+    # reward 通道占比统计窗口；用于发现某个通道长期支配总奖励。
+    REWARD_DOMINANCE_WINDOW = 200
+
+    # 单个通道长期贡献超过该比例时，自动轻微降权。
+    REWARD_DOMINANCE_LIMIT = 0.25
+
+    # 自动降权系数；每次触发时乘以该系数，最低不低于 0.3。
+    REWARD_AUTO_DECAY = 0.9
+
     # 模型保存间隔，单位：秒。
     MODEL_SAVE_INTERVAL = 1800
 
@@ -291,6 +300,12 @@ class Config:
         16,
         16,
         9,
+        12,
+        16,
+        16,
+        16,
+        16,
+        9,
         1,
         1,
         1,
@@ -350,6 +365,12 @@ class Config:
         [LSTM_TIME_STEPS],
         [LSTM_TIME_STEPS],
         [LSTM_TIME_STEPS],
+        [LABEL_SIZE_LIST[0] * LSTM_TIME_STEPS],
+        [LABEL_SIZE_LIST[1] * LSTM_TIME_STEPS],
+        [LABEL_SIZE_LIST[2] * LSTM_TIME_STEPS],
+        [LABEL_SIZE_LIST[3] * LSTM_TIME_STEPS],
+        [LABEL_SIZE_LIST[4] * LSTM_TIME_STEPS],
+        [LABEL_SIZE_LIST[5] * LSTM_TIME_STEPS],
         [LABEL_SIZE_LIST[0] * LSTM_TIME_STEPS],
         [LABEL_SIZE_LIST[1] * LSTM_TIME_STEPS],
         [LABEL_SIZE_LIST[2] * LSTM_TIME_STEPS],

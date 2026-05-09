@@ -60,7 +60,7 @@ class FeatureBuilder:
         self._fill_tower(feature, my_hero, own_tower, enemy_tower, friendly_minions, memory)
         self._fill_lane(feature, my_hero, own_tower, enemy_tower, friendly_minions, enemy_minions)
         self._fill_resource(feature, my_hero, enemy_hero, cakes, neutral_units, memory)
-        self._fill_vision(feature, my_hero, enemy_hero)
+        self._fill_vision(feature, my_hero, enemy_hero, own_tower, enemy_tower, cakes, neutral_units)
         self._fill_opponent_behavior(feature, memory)
         self._fill_rule_debug(feature, direct_push_window, defense_emergency, resource_allowed, legal_action)
 
@@ -138,12 +138,21 @@ class FeatureBuilder:
             setv(feature, base + 1, flag(slot.get("usable", False)))
             setv(feature, base + 2, n01(slot.get("cooldown", 0), 0, cooldown_max))
             setv(feature, base + 3, flag(slot.get("succUsedInFrame", 0) > 0))
+            setv(feature, base + 4, n01(slot.get("usedTimes", 0), 0, 100))
+            setv(feature, base + 5, n01(slot.get("hitHeroTimes", 0), 0, max(1, slot.get("usedTimes", 1))))
+            setv(feature, base + 6, n01(slot.get("comboEffectTime", 0), 0, 5000))
+            setv(feature, base + 7, n01(slot.get("cooldown_max", 0), 0, 30000))
+        summoner = self._summoner_slot(slots)
+        setv(feature, 176, n01(summoner.get("configId", 0), 0, 100000))
+        setv(feature, 177, flag(summoner.get("usable", False)))
+        setv(feature, 178, n01(summoner.get("cooldown", 0), 0, max(1, summoner.get("cooldown_max", 1))))
         combo = memory["combo_memory"]
         setv(feature, 184, n01(combo.get("steps_since_last_skill", 999), 0, 120))
         setv(feature, 185, n01(combo.get("steps_since_last_attack", 999), 0, 120))
         setv(feature, 186, combo.get("enhanced_attack_ready", 0.0))
         setv(feature, 187, combo.get("enhanced_attack_confidence", 0.0))
         setv(feature, 188, combo.get("combo_window_active", 0.0))
+        setv(feature, 189, combo.get("last_skill_used", 0.0))
 
     def _fill_tower(self, feature, my_hero, own_tower, enemy_tower, friendly_minions, memory):
         tower_memory = memory["tower_memory"]
@@ -156,16 +165,28 @@ class FeatureBuilder:
         setv(feature, 211, flag(self._friendly_minion_tanking(enemy_tower, friendly_minions)))
         setv(feature, 212, flag(self._can_attack_tower(my_hero, enemy_tower)))
         setv(feature, 213, n01(tower_memory.get("enemy_tower_hp_delta_1", 0.0), 0, 0.2))
+        setv(feature, 214, n01(tower_memory.get("enemy_tower_hp_delta_30", 0.0), 0, 0.5))
         setv(feature, 226, n01(tower_memory.get("own_tower_hp_delta_1", 0.0), 0, 0.2))
+        setv(feature, 227, n01(tower_memory.get("own_tower_hp_delta_30", 0.0), 0, 0.5))
         setv(feature, 240, n01(tower_memory.get("estimated_tower_range", RuleConfig.DEFAULT_TOWER_RANGE), 0, 12000))
         setv(feature, 241, tower_memory.get("tower_range_confidence", 0.0))
+        setv(feature, 242, n01(tower_memory.get("tower_aggro_count", 0.0), 0, 30))
+        setv(feature, 243, n01(max(0.0, self._dist(my_pos, self._pos(enemy_tower)) - tower_memory.get("estimated_tower_range", RuleConfig.DEFAULT_TOWER_RANGE)), 0, 12000))
+        setv(feature, 244, tower_memory.get("self_in_enemy_tower_range_estimated", 0.0))
+        setv(feature, 245, n01(tower_memory.get("safe_distance_to_enemy_tower", 0.0), 0, 15000))
+        setv(feature, 246, n01(tower_memory.get("estimated_own_tower_range", RuleConfig.DEFAULT_TOWER_RANGE), 0, 12000))
         setv(feature, 488, self._tower_risk(my_hero, enemy_tower))
 
     def _fill_lane(self, feature, my_hero, own_tower, enemy_tower, friendly_minions, enemy_minions):
+        lane_memory = self.memory.export_features().get("lane_memory", {})
         setv(feature, IDX["friendly_minion_count"], n01(len(friendly_minions), 0, 8))
         setv(feature, IDX["enemy_minion_count"], n01(len(enemy_minions), 0, 8))
         setv(feature, 274, n01(sum(self._hp_ratio(u) for u in friendly_minions), 0, 8))
         setv(feature, 275, n01(sum(self._hp_ratio(u) for u in enemy_minions), 0, 8))
+        setv(feature, 276, nsym(lane_memory.get("lane_push_delta_30", 0.0), 1.0))
+        setv(feature, 277, nsym(lane_memory.get("lane_push_delta_60", 0.0), 1.0))
+        setv(feature, 278, n01(lane_memory.get("last_hit_count", 0.0), 0, 30))
+        setv(feature, 279, n01(lane_memory.get("recent_clear_wave_efficiency", 0.0), 0, 1))
         my_pos = self._pos(my_hero)
         enemy_sorted = sorted(enemy_minions, key=lambda unit: self._dist(self._pos(unit), my_pos))
         friendly_sorted = sorted(friendly_minions, key=lambda unit: self._dist(self._pos(unit), my_pos))
@@ -174,11 +195,18 @@ class FeatureBuilder:
             setv(feature, base, self._hp_ratio(unit))
             setv(feature, base + 1, n01(self._dist(self._pos(unit), my_pos), 0, 20000))
             setv(feature, base + 2, n01(self._dist(self._pos(unit), self._pos(own_tower)), 0, 30000))
-            setv(feature, base + 3, flag(unit.get("attack_target") == (my_hero or {}).get("runtime_id")))
+            setv(feature, base + 3, n01(self._target_bucket(unit.get("attack_target"), my_hero, own_tower, enemy_tower, friendly_minions, enemy_minions), 0, 8))
         for i, unit in enumerate(friendly_sorted[:6]):
             base = 320 + i * 4
             setv(feature, base, self._hp_ratio(unit))
             setv(feature, base + 1, n01(self._dist(self._pos(unit), self._pos(enemy_tower)), 0, 30000))
+            setv(feature, base + 2, n01(self._dist(self._pos(unit), my_pos), 0, 20000))
+            setv(feature, base + 3, n01(self._target_bucket(unit.get("attack_target"), my_hero, own_tower, enemy_tower, friendly_minions, enemy_minions), 0, 8))
+        friendly_front = min((self._dist(self._pos(unit), self._pos(enemy_tower)) for unit in friendly_minions), default=30000.0)
+        enemy_front = min((self._dist(self._pos(unit), self._pos(own_tower)) for unit in enemy_minions), default=30000.0)
+        setv(feature, 344, n01(friendly_front, 0, 30000))
+        setv(feature, 345, n01(enemy_front, 0, 30000))
+        setv(feature, 346, nsym(len(friendly_minions) - len(enemy_minions), 8))
 
     def _fill_resource(self, feature, my_hero, enemy_hero, cakes, neutral_units, memory):
         setv(feature, IDX["cake_observed"], flag(cakes))
@@ -194,20 +222,38 @@ class FeatureBuilder:
             setv(feature, 364, flag(safe))
         cake_memory = memory["cake_memory"]
         setv(feature, 365, cake_memory.get("cake_effect_confidence", 0.0))
+        setv(feature, 366, nsym(cake_memory.get("hp_delta_after_cake", 0.0), 1.0))
+        setv(feature, 367, nsym(cake_memory.get("speed_delta_after_cake", 0.0), 1200.0))
+        setv(feature, 368, cake_memory.get("buff_added_after_cake", 0.0))
         setv(feature, IDX["neutral_observed"], flag(neutral_units))
         if neutral_units and my_hero:
             neutral = min(neutral_units, key=lambda n: self._dist(self._pos(my_hero), self._pos(n)))
             setv(feature, 377, self._hp_ratio(neutral))
             setv(feature, 378, n01(self._dist(self._pos(my_hero), self._pos(neutral)), 0, 30000))
             setv(feature, 379, flag(self._hp_ratio(neutral) < 0.25))
+            setv(feature, 380, n01(self._dist(self._pos(enemy_hero), self._pos(neutral)), 0, 30000) if enemy_hero else 1.0)
+            setv(feature, 381, flag(self._hp_ratio(neutral) < 0.6 and (not enemy_hero or self._dist(self._pos(my_hero), self._pos(neutral)) <= self._dist(self._pos(enemy_hero), self._pos(neutral)))))
         neutral_memory = memory["neutral_memory"]
+        setv(feature, 382, neutral_memory.get("neutral_contested_score", 0.0))
+        setv(feature, 383, neutral_memory.get("neutral_safe_to_take", 0.0))
+        setv(feature, 384, neutral_memory.get("neutral_low_hp", 0.0))
         setv(feature, 392, neutral_memory.get("neutral_spawn_estimate", 0.0))
         setv(feature, 393, neutral_memory.get("neutral_spawn_confidence", 0.0))
+        setv(feature, 394, neutral_memory.get("neutral_recently_killed", 0.0))
+        setv(feature, 395, n01(neutral_memory.get("neutral_time_to_spawn", 0.0), 0, 3000))
 
-    def _fill_vision(self, feature, my_hero, enemy_hero):
+    def _fill_vision(self, feature, my_hero, enemy_hero, own_tower, enemy_tower, cakes, neutral_units):
         setv(feature, 408, flag((my_hero or {}).get("is_in_grass", False)))
         setv(feature, 409, flag((enemy_hero or {}).get("is_in_grass", False)) if enemy_hero else 0.0)
         setv(feature, 410, n01(self._dist(self._pos(my_hero), self._pos(enemy_hero)), 0, 30000) if enemy_hero else 1.0)
+        setv(feature, 411, n01(self._dist(self._pos(my_hero), self._pos(enemy_tower)), 0, 30000))
+        setv(feature, 412, n01(self._dist(self._pos(my_hero), self._pos(own_tower)), 0, 30000))
+        if cakes and my_hero:
+            nearest_cake = min(cakes, key=lambda item: self._dist(self._pos(my_hero), self._cake_pos(item)))
+            setv(feature, 413, n01(self._dist(self._pos(my_hero), self._cake_pos(nearest_cake)), 0, 30000))
+        if neutral_units and my_hero:
+            nearest_neutral = min(neutral_units, key=lambda unit: self._dist(self._pos(my_hero), self._pos(unit)))
+            setv(feature, 414, n01(self._dist(self._pos(my_hero), self._pos(nearest_neutral)), 0, 30000))
 
     def _fill_opponent_behavior(self, feature, memory):
         behavior = memory["opponent_behavior"]
@@ -239,6 +285,30 @@ class FeatureBuilder:
         own_tower_damaged = memory["tower_memory"].get("own_tower_hp_delta_1", 0.0) > 0.01
         return bool(own_tower_low or (enemy_minions and own_tower_damaged))
 
+    def _summoner_slot(self, slots):
+        summoner_ids = (80102, 80103, 80104, 80105, 80107, 80108, 80109, 80110, 80115, 80121)
+        for slot in slots:
+            if slot.get("configId") in summoner_ids:
+                return slot
+        return {}
+
+    def _target_bucket(self, target_id, my_hero, own_tower, enemy_tower, friendly_minions, enemy_minions):
+        if target_id is None:
+            return 0
+        if my_hero and target_id == my_hero.get("runtime_id"):
+            return 1
+        if own_tower and target_id == own_tower.get("runtime_id"):
+            return 2
+        if enemy_tower and target_id == enemy_tower.get("runtime_id"):
+            return 3
+        friendly_ids = {unit.get("runtime_id") for unit in friendly_minions}
+        enemy_ids = {unit.get("runtime_id") for unit in enemy_minions}
+        if target_id in friendly_ids:
+            return 4
+        if target_id in enemy_ids:
+            return 5
+        return 6
+
     def _split_heroes(self, frame_state, observation):
         player_id = observation.get("player_id")
         player_camp = observation.get("player_camp", observation.get("camp"))
@@ -255,10 +325,21 @@ class FeatureBuilder:
                     break
         my_camp = (my_hero or {}).get("camp", player_camp)
         for hero in heroes:
-            if hero is not my_hero and not self._same_camp(hero.get("camp"), my_camp):
+            if (
+                hero is not my_hero
+                and not self._same_camp(hero.get("camp"), my_camp)
+                and self._visible_to_camp(hero, my_camp)
+            ):
                 enemy_hero = hero
                 break
         return my_hero, enemy_hero
+
+    def _visible_to_camp(self, obj, camp):
+        visible = (obj or {}).get("camp_visible", None)
+        camp_idx = self._camp_value(camp)
+        if isinstance(visible, list) and camp_idx in (1, 2) and len(visible) >= camp_idx:
+            return bool(visible[camp_idx - 1])
+        return obj is not None
 
     def _split_npcs(self, frame_state, my_camp):
         own_tower, enemy_tower, friendly_minions, enemy_minions, neutral_units = None, None, [], [], []

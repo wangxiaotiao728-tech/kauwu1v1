@@ -102,6 +102,7 @@ class Model(PPOActorCriticLSTM):
         self.clip_param = Config.CLIP_PARAM
         self.var_beta = Config.BETA_START
         self.learning_rate = Config.INIT_LEARNING_RATE_START
+        self.ppo_epoch = Config.PPO_EPOCH
         self.legal_action_size = Config.LEGAL_ACTION_SIZE_LIST
         self.cut_points = [value[0] for value in Config.data_shapes]
         self.restore_list = []
@@ -157,8 +158,16 @@ class Model(PPOActorCriticLSTM):
             )
             old_prob_list.append(old_prob)
 
+        rule_bias_list = []
+        rule_bias_start = old_prob_start + len(self.label_size_list)
+        for i in range(len(self.label_size_list)):
+            rule_bias = data_list[rule_bias_start + i].reshape(
+                -1, self.data_split_shape[rule_bias_start + i]
+            )
+            rule_bias_list.append(rule_bias)
+
         weight_list = []
-        weight_start = 3 + 2 * len(self.label_size_list)
+        weight_start = 3 + 3 * len(self.label_size_list)
         for i in range(len(self.label_size_list)):
             weight = data_list[weight_start + i].reshape(-1, self.data_split_shape[weight_start + i]).squeeze(1)
             weight_list.append(weight)
@@ -186,7 +195,7 @@ class Model(PPOActorCriticLSTM):
             if not reinforce:
                 continue
             reinforce_heads += 1
-            logits = label_result[i]
+            logits = label_result[i] + rule_bias_list[i].to(label_result[i].device)
             legal = legal_action_list[i].float()
             legal = torch.where(legal.sum(dim=1, keepdim=True) > 0, legal, torch.ones_like(legal))
             masked_logits = logits.masked_fill(legal <= 0, -1e9)

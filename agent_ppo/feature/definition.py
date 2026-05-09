@@ -118,6 +118,12 @@ def build_frame(agent, observation):
         lstm_info=np.concatenate([lstm_cell.flatten(), lstm_hidden.flatten()]).reshape([-1]),
         is_train=False if action[0] < 0 else is_train,
     )
+    frame.rule_bias = (
+        np.asarray(act_data.rule_bias, dtype=np.float32).reshape([-1])
+        if getattr(act_data, "rule_bias", None) is not None
+        else np.zeros([sum(Config.LABEL_SIZE_LIST)], dtype=np.float32)
+    )
+    frame.rule_state = int(getattr(act_data, "rule_state", 0) or 0)
     return frame
 
 
@@ -264,6 +270,13 @@ class FrameCollector:
                 for p in rl_info.prob:
                     dlen = len(p)
                     sample_batch[cnt, idx : idx + dlen] = p
+                    idx += dlen
+
+                rule_bias = getattr(rl_info, "rule_bias", np.zeros([sum(Config.LABEL_SIZE_LIST)], dtype=np.float32))
+                rule_bias_parts = np.split(np.asarray(rule_bias, dtype=np.float32), np.cumsum(Config.LABEL_SIZE_LIST)[:-1])
+                for bias in rule_bias_parts:
+                    dlen = len(bias)
+                    sample_batch[cnt, idx : idx + dlen] = bias
                     idx += dlen
 
                 dlen = 6

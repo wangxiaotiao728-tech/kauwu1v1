@@ -75,6 +75,10 @@ class RuleController:
             self._bias_head(logit_bias, 0, 2, 1.0)
             state_id = RULE_STATES["RETREAT_TOWER_AGGRO"]
 
+        if self.hard_mask_rate > RuleConfig.HARD_MASK_RATE_LIMIT and not my_dead:
+            # hard mask 过强时，保留 bias 引导，非死亡场景降级为 bias-only。
+            hard_mask = [np.zeros_like(mask) for mask in hard_mask]
+
         logit_bias = [np.clip(bias, -RuleConfig.LOGIT_BIAS_ABS_MAX, RuleConfig.LOGIT_BIAS_ABS_MAX) for bias in logit_bias]
         self._update_stats(hard_mask, logit_bias)
         debug["hard_mask_rate"] = self.hard_mask_rate

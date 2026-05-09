@@ -69,21 +69,22 @@ class Algorithm:
         format_inputs = [feature_vec, lstm_hidden_state, lstm_cell_state]
 
         self.model.set_train_mode()
-        self.optimizer.zero_grad()
+        ppo_epoch = max(1, int(getattr(self.model, "ppo_epoch", Config.PPO_EPOCH)))
+        total_loss, info_list = None, None
+        for _ in range(ppo_epoch):
+            self.optimizer.zero_grad()
+            rst_list = self.model(format_inputs)
+            total_loss, info_list = self.model.compute_loss(data_list, rst_list)
+            total_loss.backward()
 
-        rst_list = self.model(format_inputs)
-        total_loss, info_list = self.model.compute_loss(data_list, rst_list)
+            # grad clip
+            # 梯度剪裁
+            if Config.USE_GRAD_CLIP:
+                torch.nn.utils.clip_grad_norm_(self.parameters, Config.GRAD_CLIP_RANGE)
+
+            self.optimizer.step()
+            self.train_step += 1
         results["total_loss"] = total_loss.item()
-
-        total_loss.backward()
-
-        # grad clip
-        # 梯度剪裁
-        if Config.USE_GRAD_CLIP:
-            torch.nn.utils.clip_grad_norm_(self.parameters, Config.GRAD_CLIP_RANGE)
-
-        self.optimizer.step()
-        self.train_step += 1
 
         # update the learning rate
         # 更新学习率

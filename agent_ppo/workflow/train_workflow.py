@@ -183,6 +183,7 @@ class EpisodeRunner:
                 self.train_episode_cnt += 1
             frame_no = 0
             reward_sum_list = [0] * self.agent_num
+            reward_channel_sum_list = [dict() for _ in range(self.agent_num)]
             is_train_test = os.environ.get("is_train_test", "False").lower() == "true"
             self.logger.info(
                 f"Episode {self.episode_cnt} start, opponent_agent={self.current_opponent_agent}, "
@@ -201,6 +202,7 @@ class EpisodeRunner:
                     )
                     observation[str(i)]["reward"] = reward
                     reward_sum_list[i] += reward["reward_sum"]
+                    self._accumulate_reward_channels(reward_channel_sum_list[i], reward)
 
             while True:
                 # Initialize the default actions. If the agent does not make a decision, env.step uses the default action.
@@ -248,6 +250,7 @@ class EpisodeRunner:
                         )
                         observation[str(i)]["reward"] = reward
                         reward_sum_list[i] += reward["reward_sum"]
+                        self._accumulate_reward_channels(reward_channel_sum_list[i], reward)
 
                 # Normal end or timeout exit, run train_test will exit early
                 # 正常结束或超时退出，运行train_test时会提前退出
@@ -271,6 +274,13 @@ class EpisodeRunner:
                         if self.monitor:
                             if is_eval:
                                 monitor_data["reward"] = round(reward_sum_list[monitor_side], 2)
+                            monitor_data.update(
+                                {
+                                    key: round(value, 4)
+                                    for key, value in reward_channel_sum_list[monitor_side].items()
+                                }
+                            )
+                            monitor_data.update(self._agent_monitor_metrics(self.agents[monitor_side]))
                             self.monitor.put_data({os.getpid(): monitor_data})
                             self.last_report_monitor_time = now
 
@@ -304,7 +314,7 @@ class EpisodeRunner:
             if i == monitor_side:
                 # monitor_side uses the latest model
                 # monitor_side 使用最新模型
-                agent.load_model(id="latest")
+                agent.load_model(id="latest", load_optimizer=self._should_load_optimizer())
             else:
                 if opponent_agent == "common_ai":
                     # common_ai does not need to load a model, no need to predict
@@ -376,6 +386,39 @@ class EpisodeRunner:
             if hasattr(agent, "model"):
                 agent.model.var_beta = entropy_coef
                 agent.model.clip_param = clip_eps
+                agent.model.ppo_epoch = int(stage.get("ppo_epoch", 1))
+
+    def _should_load_optimizer(self):
+        # 同阶段中断恢复可设置 HOK_LOAD_OPTIMIZER=1；跨阶段课程切换保持默认 False。
+        return os.environ.get("HOK_LOAD_OPTIMIZER", "0").lower() in ("1", "true", "yes")
+
+    def _accumulate_reward_channels(self, target, reward):
+        for key in (
+            "terminal",
+            "tower",
+            "tower_defense",
+            "lane",
+            "growth",
+            "last_hit",
+            "enhanced_tower",
+            "resource",
+            "cake",
+            "skill",
+            "death",
+            "tower_risk",
+        ):
+            target[key] = target.get(key, 0.0) + float(reward.get(key, 0.0))
+
+    def _agent_monitor_metrics(self, agent):
+        hidden = getattr(agent, "lstm_hidden", None)
+        hidden_norm = 0.0 if hidden is None else float(sum(float(x) * float(x) for x in hidden) ** 0.5)
+        rule_controller = getattr(agent, "rule_controller", None)
+        return {
+            "hard_mask_rate": 0.0 if rule_controller is None else round(rule_controller.hard_mask_rate, 4),
+            "rule_bias_count": 0 if rule_controller is None else rule_controller.rule_bias_count,
+            "feature_nan_count": 0,
+            "hidden_norm": round(hidden_norm, 4),
+        }
 
     def _curriculum_selfplay_prob(self):
         if self._common_ai_gate_passed():

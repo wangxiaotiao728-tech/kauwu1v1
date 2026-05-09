@@ -3,6 +3,8 @@
 """目标型 reward，禁止普通血量变化奖惩。"""
 
 import math
+import os
+from collections import deque
 
 from agent_ppo.conf.conf import CurriculumConfig, GameConfig, RuleConfig
 
@@ -30,6 +32,12 @@ class GameRewardManager:
         self.m_cur_calc_frame_map = init_calc_frame_map()
         self.m_last_scores = None
         self.m_last_terminal_frame = -1
+        self.m_channel_abs_history = {
+            key: deque(maxlen=GameConfig.REWARD_DOMINANCE_WINDOW)
+            for key in GameConfig.REWARD_WEIGHT_DICT
+        }
+        self.m_total_abs_history = deque(maxlen=GameConfig.REWARD_DOMINANCE_WINDOW)
+        self.m_dynamic_scale = {key: 1.0 for key in GameConfig.REWARD_WEIGHT_DICT}
 
     def init_max_exp_of_each_hero(self):
         pass
@@ -129,12 +137,29 @@ class GameRewardManager:
 
     def _write_reward(self, reward_dict, reward_items, channels):
         reward_sum = 0.0
+        weighted_items = {}
         for reward_name, reward_struct in self.m_cur_calc_frame_map.items():
             reward_struct.value = reward_items.get(reward_name, 0.0)
-            reward_sum += reward_struct.value * reward_struct.weight
+            weighted_value = reward_struct.value * reward_struct.weight * self.m_dynamic_scale.get(reward_name, 1.0)
+            weighted_items[reward_name] = weighted_value
+            reward_sum += weighted_value
             reward_dict[reward_name] = reward_struct.value
+        self._update_reward_dominance(weighted_items)
         reward_dict.update(channels)
         reward_dict["reward_sum"] = self._clamp(reward_sum, GameConfig.REWARD_SUM_CLIP_MIN, GameConfig.REWARD_SUM_CLIP_MAX)
+
+    def _update_reward_dominance(self, weighted_items):
+        total_abs = sum(abs(value) for value in weighted_items.values())
+        self.m_total_abs_history.append(total_abs)
+        for key, value in weighted_items.items():
+            self.m_channel_abs_history[key].append(abs(value))
+        total_mean = sum(self.m_total_abs_history) / max(1, len(self.m_total_abs_history))
+        if total_mean <= 1e-6 or len(self.m_total_abs_history) < GameConfig.REWARD_DOMINANCE_WINDOW:
+            return
+        for key, history in self.m_channel_abs_history.items():
+            channel_mean = sum(history) / max(1, len(history))
+            if channel_mean / total_mean > GameConfig.REWARD_DOMINANCE_LIMIT:
+                self.m_dynamic_scale[key] = max(0.3, self.m_dynamic_scale.get(key, 1.0) * GameConfig.REWARD_AUTO_DECAY)
 
     def _channels(self, reward_items):
         weights = GameConfig.REWARD_WEIGHT_DICT
@@ -170,7 +195,8 @@ class GameRewardManager:
         return items
 
     def _stage(self):
-        return CurriculumConfig.CURRICULUM_STAGES.get(CurriculumConfig.CURRENT_STAGE, CurriculumConfig.CURRICULUM_STAGES["S1_BASIC"])
+        stage_name = os.environ.get("HOK_CURRICULUM_STAGE", CurriculumConfig.CURRENT_STAGE)
+        return CurriculumConfig.CURRICULUM_STAGES.get(stage_name, CurriculumConfig.CURRICULUM_STAGES["S1_BASIC"])
 
     def _lane_score(self, own_tower, enemy_tower, friendly_minions, enemy_minions):
         friendly_count = self._safe_div(len(friendly_minions), 8.0)
