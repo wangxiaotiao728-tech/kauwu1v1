@@ -79,15 +79,60 @@ def _is_alive(actor):
     return _get_any(actor, "hp", default=0) > 0
 
 
+def _enum_str(value):
+    return str(value).upper() if value is not None else ""
+
+
+def _enum_matches(value, names, nums):
+    s = _enum_str(value)
+    if s in names:
+        return True
+    try:
+        return int(value) in nums
+    except Exception:
+        return False
+
+
+def _config_id(actor):
+    return _get_any(actor, "config_id", "configId", default=None)
+
+
+def _actor_type(actor):
+    return _get_any(actor, "actor_type", "actorType", default=None)
+
+
+def _sub_type(actor):
+    return _get_any(actor, "sub_type", "subType", default=None)
+
+
 def _is_tower(npc):
-    return _get_any(npc, "sub_type", default=-1) == 21
+    # Official strict ordinary tower check: ACTOR_SUB_TOWER only.
+    # Numeric fallback is configured in GameConfig.TOWER_SUB_TYPES.
+    return _enum_matches(_sub_type(npc), {"ACTOR_SUB_TOWER"}, set(getattr(GameConfig, "TOWER_SUB_TYPES", {21})))
 
 
 def _is_soldier(npc):
-    # Common 1v1 protocol uses NPC sub_type for soldiers; exact numeric values
-    # may vary, so treat non-tower non-monster NPCs as soldiers for reward logic.
-    sub = _get_any(npc, "sub_type", default=-1)
-    return sub not in (21, -1)
+    # Official strict soldier check: ACTOR_SUB_SOLDIER only.
+    # Unknown NPCs/monsters must not be counted as soldiers.
+    if npc is None or not _is_alive(npc):
+        return False
+    if _enum_matches(_sub_type(npc), {"ACTOR_SUB_SOLDIER"}, set(getattr(GameConfig, "SOLDIER_SUB_TYPES", set()))):
+        return True
+    try:
+        return int(_config_id(npc)) in set(getattr(GameConfig, "SOLDIER_CONFIG_IDS", set()))
+    except Exception:
+        return False
+
+
+def _is_monster(npc):
+    if npc is None or not _is_alive(npc):
+        return False
+    if _enum_matches(_actor_type(npc), {"ACTOR_TYPE_MONSTER"}, set(getattr(GameConfig, "MONSTER_ACTOR_TYPES", set()))):
+        return True
+    try:
+        return int(_config_id(npc)) in set(getattr(GameConfig, "MONSTER_CONFIG_IDS", set()))
+    except Exception:
+        return False
 
 
 class GameRewardManager:
@@ -194,15 +239,15 @@ class GameRewardManager:
     def _friendly_soldier_near_tower(self, frame_data, camp, tower):
         if tower is None:
             return False
-        tower_range = float(_get_any(tower, "attack_range", default=8000) or 8000)
+        tower_range = float(_get_any(tower, "attack_range", default=0) or 0)
         for npc in frame_data.get("npc_states", []):
             if _get_any(npc, "camp", default=None) != camp:
                 continue
-            if _is_tower(npc):
+            if not _is_soldier(npc):
                 continue
             if _hp_rate(npc) <= 0:
                 continue
-            if _dist(npc, tower) <= tower_range * 1.10:
+            if tower_range > 0 and _dist(npc, tower) <= tower_range * 1.10:
                 return True
         return False
 
@@ -277,7 +322,7 @@ class GameRewardManager:
     def _calc_under_tower_behavior(self, frame_data, hero, enemy_hero, enemy_tower, camp):
         if hero is None or enemy_tower is None:
             return 0.0
-        tower_range = float(_get_any(enemy_tower, "attack_range", default=8000) or 8000)
+        tower_range = float(_get_any(enemy_tower, "attack_range", default=0) or 0)
         in_tower_range = _dist(hero, enemy_tower) <= tower_range
         if not in_tower_range:
             return 0.0
@@ -295,7 +340,7 @@ class GameRewardManager:
                 for npc in frame_data.get("npc_states", []):
                     if _get_any(npc, "camp", default=None) == camp:
                         continue
-                    if _is_tower(npc):
+                    if not _is_soldier(npc):
                         continue
                     if attack_target == _get_any(npc, "runtime_id", default=None):
                         reward += 0.2
@@ -303,17 +348,21 @@ class GameRewardManager:
         return reward
 
     def _calc_passive_skills(self, hero):
+        """Official protocol exposes PassiveSkill(passive_skillid, cooldown).
+
+        It does not expose D401-style level/triggered fields, so this reward is
+        intentionally conservative. The default weight in conf.py is 0.0; this
+        value is kept only for monitoring / future ablation.
+        """
         passive_skills = _get_any(hero, "passive_skill", default=[]) or []
-        total_level = sum(int(_get(skill, "level", 0) or 0) for skill in passive_skills)
-        reward = total_level * 0.02
+        if not passive_skills:
+            return 0.0
+        ready_cnt = 0
         for skill in passive_skills:
-            if bool(_get(skill, "triggered", False)):
-                reward += 0.1 + int(_get(skill, "level", 0) or 0) * 0.02
-        if total_level >= 5:
-            reward += 0.3
-        elif total_level >= 3:
-            reward += 0.1
-        return reward
+            cooldown = float(_get(skill, "cooldown", 0) or 0)
+            if cooldown <= 0:
+                ready_cnt += 1
+        return ready_cnt / max(1.0, float(len(passive_skills)))
 
     def set_cur_calc_frame_vec(self, calc_frame_map, frame_data, camp):
         main_hero, enemy_hero = self._find_main_and_enemy(frame_data, camp)

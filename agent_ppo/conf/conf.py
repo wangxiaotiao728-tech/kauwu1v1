@@ -33,7 +33,7 @@ class GameConfig:
         # lane_clear is a result-style lane advantage reward, not per-HP damage shaping.
         "lane_clear": 0.12,
         # bad_skill is a small penalty for increasing usedTimes without hitHeroTimes.
-        "bad_skill": -0.02,
+        "bad_skill": -0.005,
         # D401 replica rewards
         "hero_hurt": -0.10,
         "total_damage": 0.03,
@@ -43,7 +43,7 @@ class GameConfig:
         "no_ops": -0.005,
         "in_grass": 0.001,
         "under_tower_behavior": 0.15,
-        "passive_skills": 0.01,
+        "passive_skills": 0.0,
     }
 
     # Full D401-style reward groups. Each group gets its own return/advantage
@@ -77,6 +77,19 @@ class GameConfig:
     # 0 disables it; 20000 matches the official max-frame horizon.
     TIME_SCALE_ARG = 20000
     MODEL_SAVE_INTERVAL = 1800
+
+    # Official-protocol strict NPC type configuration.
+    # String enum names are handled directly. Numeric enum values vary by environment
+    # build, so only the known baseline tower value is enabled by default. Fill
+    # SOLDIER_SUB_TYPES / MONSTER_ACTOR_TYPES after checking NPC_SCAN logs if the
+    # environment provides integer enum values.
+    TOWER_SUB_TYPES = {21}
+    SOLDIER_SUB_TYPES = set()
+    MONSTER_ACTOR_TYPES = set()
+    SOLDIER_CONFIG_IDS = set()
+    MONSTER_CONFIG_IDS = set()
+    DEBUG_NPC_SCAN = False
+    DEBUG_NPC_SCAN_MAX_FRAME = 200
 
 
 class DimConfig:
