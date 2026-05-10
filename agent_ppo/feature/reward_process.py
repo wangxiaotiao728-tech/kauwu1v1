@@ -206,6 +206,43 @@ class GameRewardManager:
                 return True
         return False
 
+
+    def _enemy_soldier_count(self, frame_data, camp):
+        """Count alive enemy soldiers from the perspective of camp.
+
+        This is intentionally coarse and result-style: reducing enemy soldier
+        count while keeping friendly soldiers creates positive lane advantage.
+        It does not reward every point of minion HP damage.
+        """
+        cnt = 0
+        for npc in frame_data.get("npc_states", []):
+            if _get_any(npc, "camp", default=None) == camp:
+                continue
+            if _is_tower(npc):
+                continue
+            if not _is_alive(npc):
+                continue
+            if not _is_soldier(npc):
+                continue
+            cnt += 1
+        return cnt
+
+    def _calc_bad_skill(self, hero):
+        """Small miss proxy: usedTimes - hitHeroTimes.
+
+        D401 already rewards skill_hit. This extra metric gives a weak negative
+        signal when skill usage increases but hero hit count does not. Keep the
+        configured weight small because some skills are valid for clearing lane.
+        """
+        skill_state = _get_any(hero, "skill_state", default={})
+        slot_states = _get(skill_state, "slot_states", []) or []
+        used_total = 0.0
+        hit_total = 0.0
+        for slot in slot_states:
+            used_total += float(_get_any(slot, "usedTimes", "used_times", default=0) or 0)
+            hit_total += float(_get_any(slot, "hitHeroTimes", "hit_hero_times", default=0) or 0)
+        return max(0.0, used_total - hit_total) / 100.0
+
     def _calc_skill_hit(self, hero):
         skill_state = _get_any(hero, "skill_state", default={})
         slot_states = _get(skill_state, "slot_states", []) or []
@@ -310,6 +347,11 @@ class GameRewardManager:
                 reward_struct.cur_frame_value = float(_get_any(main_hero, "money_cnt", "money", default=0)) / 30000.0
             elif reward_name == "forward":
                 reward_struct.cur_frame_value = self.calculate_forward(main_hero, main_tower, enemy_tower)
+            elif reward_name == "lane_clear":
+                # Potential is negative enemy soldier count. Through the standard
+                # zero-sum delta, this rewards reducing enemy soldiers and keeping
+                # friendly lane presence.
+                reward_struct.cur_frame_value = -float(self._enemy_soldier_count(frame_data, camp)) / 10.0
             elif reward_name == "hero_hurt":
                 reward_struct.cur_frame_value = float(
                     _get_any(main_hero, "total_be_hurt_by_hero", "totalBeHurtByHero", default=0)
@@ -326,6 +368,8 @@ class GameRewardManager:
                 reward_struct.cur_frame_value = crit_rate * crit_effe / 1e4
             elif reward_name == "skill_hit":
                 reward_struct.cur_frame_value = self._calc_skill_hit(main_hero)
+            elif reward_name == "bad_skill":
+                reward_struct.cur_frame_value = self._calc_bad_skill(main_hero)
             elif reward_name == "no_ops":
                 behav = _get_any(main_hero, "behav_mode", default="")
                 reward_struct.cur_frame_value = 1.0 if str(behav) == "State_Idle" or behav == 0 else 0.0

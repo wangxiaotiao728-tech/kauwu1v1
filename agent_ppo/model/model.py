@@ -50,14 +50,21 @@ class Model(nn.Module):
         self.legal_action_dim = int(np.sum(Config.LEGAL_ACTION_SIZE_LIST))
         self.lstm_hidden_dim = Config.LSTM_UNIT_SIZE
 
-        # Baseline feature split: hero(3) + enemy tower/organ(7).
-        # If the baseline feature process is expanded later, update these slices explicitly.
-        self.hero_feature_dim = min(3, self.feature_dim)
-        self.organ_feature_dim = max(0, self.feature_dim - self.hero_feature_dim)
+        # Expanded grouped feature encoders.
+        # Layout must match agent_ppo.feature.feature_process.FeatureProcess.
+        # self(16), enemy(24), skills(20), lane(28), tower(16), target(16), history(8).
+        self.feature_group_sizes = list(getattr(Config, "FEATURE_GROUP_SIZES", [self.feature_dim]))
+        if sum(self.feature_group_sizes) != self.feature_dim:
+            # Fallback to one group if the config is inconsistent.
+            self.feature_group_sizes = [self.feature_dim]
 
-        self.hero_encoder = MLP([self.hero_feature_dim, 64, 128], "hero_encoder", non_linearity_last=True)
-        self.organ_encoder = MLP([max(1, self.organ_feature_dim), 64, 128], "organ_encoder", non_linearity_last=True)
-        self.fusion_mlp = MLP([256, 512, self.lstm_unit_size], "fusion_mlp", non_linearity_last=True)
+        self.group_encoders = nn.ModuleList(
+            [
+                MLP([max(1, group_dim), 64, 64], f"feature_group_{idx}_encoder", non_linearity_last=True)
+                for idx, group_dim in enumerate(self.feature_group_sizes)
+            ]
+        )
+        self.fusion_mlp = MLP([64 * len(self.feature_group_sizes), 512, self.lstm_unit_size], "fusion_mlp", non_linearity_last=True)
 
         self.lstm = nn.LSTM(
             input_size=self.lstm_unit_size,
@@ -100,13 +107,22 @@ class Model(nn.Module):
         )
 
     def _encode_feature(self, feature_vec: torch.Tensor) -> torch.Tensor:
-        hero_feat = feature_vec[:, : self.hero_feature_dim]
-        organ_feat = feature_vec[:, self.hero_feature_dim :]
-        if self.organ_feature_dim <= 0:
-            organ_feat = torch.zeros((feature_vec.shape[0], 1), device=feature_vec.device, dtype=feature_vec.dtype)
-        hero_emb = self.hero_encoder(hero_feat)
-        organ_emb = self.organ_encoder(organ_feat)
-        return self.fusion_mlp(torch.cat([hero_emb, organ_emb], dim=1))
+        # Defensive padding/truncation so old checkpoints/test samples fail gracefully.
+        if feature_vec.shape[1] < self.feature_dim:
+            pad = torch.zeros(
+                (feature_vec.shape[0], self.feature_dim - feature_vec.shape[1]),
+                device=feature_vec.device,
+                dtype=feature_vec.dtype,
+            )
+            feature_vec = torch.cat([feature_vec, pad], dim=1)
+        elif feature_vec.shape[1] > self.feature_dim:
+            feature_vec = feature_vec[:, : self.feature_dim]
+
+        chunks = torch.split(feature_vec, self.feature_group_sizes, dim=1)
+        enc_list = []
+        for encoder, chunk in zip(self.group_encoders, chunks):
+            enc_list.append(encoder(chunk))
+        return self.fusion_mlp(torch.cat(enc_list, dim=1))
 
     def forward(self, data_list, inference=False):
         feature_vec, lstm_hidden_init, lstm_cell_init = data_list

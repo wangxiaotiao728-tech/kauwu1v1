@@ -20,24 +20,29 @@ replicating the previous solution's late-stage algorithmic improvements:
 class GameConfig:
     REWARD_WEIGHT_DICT = {
         # Baseline/objective rewards
-        "tower_hp_point": 5.0,
+        "tower_hp_point": 8.0,
         "hp_point": 1.0,
-        "money": 0.02,
-        "exp": 0.02,
+        "money": 0.05,
+        "exp": 0.05,
         "kill": 1.0,
         "death": -1.0,
-        "forward": 0.01,
+        "forward": 0.015,
         "ep_rate": 0.01,
-        "last_hit": 0.02,
+        "last_hit": 0.06,
+        # Targeted fixes for the observed issue: lane ignorance and random skill use.
+        # lane_clear is a result-style lane advantage reward, not per-HP damage shaping.
+        "lane_clear": 0.12,
+        # bad_skill is a small penalty for increasing usedTimes without hitHeroTimes.
+        "bad_skill": -0.02,
         # D401 replica rewards
         "hero_hurt": -0.10,
-        "total_damage": 0.10,
-        "hero_damage": 0.30,
+        "total_damage": 0.03,
+        "hero_damage": 0.05,
         "crit": 0.01,
-        "skill_hit": 0.01,
-        "no_ops": -0.001,
+        "skill_hit": 0.03,
+        "no_ops": -0.005,
         "in_grass": 0.001,
-        "under_tower_behavior": 0.10,
+        "under_tower_behavior": 0.15,
         "passive_skills": 0.01,
     }
 
@@ -48,6 +53,7 @@ class GameConfig:
             "money",
             "exp",
             "last_hit",
+            "lane_clear",
             "forward",
             "ep_rate",
             "total_damage",
@@ -55,6 +61,7 @@ class GameConfig:
             "hero_damage",
             "crit",
             "skill_hit",
+            "bad_skill",
             "in_grass",
             "no_ops",
             "under_tower_behavior",
@@ -73,8 +80,9 @@ class GameConfig:
 
 
 class DimConfig:
-    # Keep baseline feature dim for pure replication first.
-    DIM_OF_FEATURE = [10]
+    # Expanded D401-compatible feature dim.
+    # 128 dims provide lane/skill/tower/target state needed by the current reward design.
+    DIM_OF_FEATURE = [128]
 
 
 class Config:
@@ -86,6 +94,8 @@ class Config:
     IS_REINFORCE_TASK_LIST = [True, True, True, True, True, True]
 
     FEATURE_DIM = DimConfig.DIM_OF_FEATURE[0]
+    # Feature layout: self(16), enemy(24), skills(20), lane(28), tower(16), target(16), history(8)
+    FEATURE_GROUP_SIZES = [16, 24, 20, 28, 16, 16, 8]
     LEGAL_ACTION_DIM = 85
     REWARD_GROUP_NAMES = GameConfig.REWARD_GROUP_NAMES
     REWARD_GROUP_NUM = len(REWARD_GROUP_NAMES)
@@ -117,13 +127,13 @@ class Config:
     )
     SERI_VEC_SPLIT_SHAPE = [(FEATURE_DIM,), (LEGAL_ACTION_DIM,)]
 
-    INIT_LEARNING_RATE_START = 3e-4
+    INIT_LEARNING_RATE_START = 2e-4
     TARGET_LR = 8e-5
     TARGET_STEP = 50000
-    BETA_START = 0.020
-    TARGET_BETA = 0.005
+    BETA_START = 0.010
+    TARGET_BETA = 0.003
     LOG_EPSILON = 1e-6
-    CLIP_PARAM = 0.20
+    CLIP_PARAM = 0.18
     TARGET_CLIP_PARAM = 0.12
     PPO_EPOCH = 1
 
