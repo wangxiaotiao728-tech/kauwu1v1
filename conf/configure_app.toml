@@ -35,7 +35,7 @@ reverb_sampler = "reverb.selectors.Uniform"
 # reverb_error_buffer: Tolerance buffer for ratio constraint, similar to TCP sliding window (only for SampleToInsertRatio)
 # 参数reverb_error_buffer: 比例限制的弹性缓冲区间，类似TCP滑动窗口（仅SampleToInsertRatio模式生效）
 reverb_rate_limiter = "SampleToInsertRatio"
-reverb_samples_per_insert = 16
+reverb_samples_per_insert = 8
 reverb_error_buffer = 16
 
 # Training batch size limit for Learner

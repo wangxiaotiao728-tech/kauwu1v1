@@ -7,6 +7,7 @@
 
 import os
 import time
+import math
 import torch
 import numpy as np
 
@@ -50,11 +51,21 @@ class Algorithm:
         self.model.set_train_mode()
         last_total_loss = None
         last_info_list = None
+        last_feature_nan_count = 0.0
+        last_hidden_norm = 0.0
 
         for _ in range(max(1, int(getattr(Config, "PPO_EPOCH", 1)))):
             self.optimizer.zero_grad()
             format_inputs = self._format_inputs(data_list)
+            feature_vec = format_inputs[0]
+            with torch.no_grad():
+                bad_feature = torch.isnan(feature_vec) | torch.isinf(feature_vec)
+                last_feature_nan_count = float(torch.sum(bad_feature).item())
             rst_list = self.model(format_inputs)
+            with torch.no_grad():
+                hidden_output = getattr(self.model, "lstm_hidden_output", None)
+                if hidden_output is not None:
+                    last_hidden_norm = float(torch.norm(hidden_output.detach(), dim=-1).mean().item())
             total_loss, info_list = self.model.compute_loss(data_list, rst_list)
             total_loss.backward()
             if Config.USE_GRAD_CLIP:
@@ -72,13 +83,15 @@ class Algorithm:
 
         # Optional model-level dynamic schedules.
         if hasattr(self.model, "var_beta"):
-            progress = min(1.0, self.train_step / max(1, Config.TARGET_STEP))
-            self.model.var_beta = Config.TARGET_BETA + (Config.BETA_START - Config.TARGET_BETA) * (1.0 - progress)
+            hold_steps = int(getattr(Config, "BETA_HOLD_STEPS", 0))
+            decay_steps = max(1, Config.TARGET_STEP - hold_steps)
+            progress = min(1.0, max(0.0, self.train_step - hold_steps) / decay_steps)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            self.model.var_beta = Config.TARGET_BETA + (Config.BETA_START - Config.TARGET_BETA) * cosine
         if hasattr(self.model, "clip_param"):
             progress = min(1.0, self.train_step / max(1, Config.TARGET_STEP))
-            self.model.clip_param = Config.TARGET_CLIP_PARAM + (Config.CLIP_PARAM - Config.TARGET_CLIP_PARAM) * (
-                1.0 - progress
-            )
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            self.model.clip_param = Config.TARGET_CLIP_PARAM + (Config.CLIP_PARAM - Config.TARGET_CLIP_PARAM) * cosine
 
         info_flat = []
         for info in last_info_list:
@@ -87,27 +100,27 @@ class Algorithm:
             else:
                 info_flat.append(info.item())
 
-        results = {"total_loss": round(float(last_total_loss.item()), 4)}
+        _, metric_list = info_flat
+        value_loss, policy_loss, entropy_loss = metric_list[:3]
+        approx_kl = metric_list[3] if len(metric_list) > 3 else 0.0
+        clip_fraction = metric_list[4] if len(metric_list) > 4 else 0.0
+        lr = self.optimizer.param_groups[0].get("lr", 0.0)
+        results = {
+            "total_loss": round(float(last_total_loss.item()), 4),
+            "value_loss": round(value_loss, 4),
+            "policy_loss": round(policy_loss, 4),
+            "entropy_loss": round(entropy_loss, 4),
+            "approx_kl": round(approx_kl, 6),
+            "clip_fraction": round(clip_fraction, 4),
+            "learning_rate": round(lr, 8),
+            "grad_norm": round(float(grad_norm), 4) if "grad_norm" in locals() else 0.0,
+            "hidden_norm": round(last_hidden_norm, 4),
+            "feature_nan_count": round(last_feature_nan_count, 4),
+            "entropy_beta": round(float(getattr(self.model, "var_beta", 0.0)), 6),
+            "ppo_clip": round(float(getattr(self.model, "clip_param", 0.0)), 4),
+        }
         now = time.time()
         if now - self.last_report_monitor_time >= 60:
-            _, metric_list = info_flat
-            value_loss, policy_loss, entropy_loss = metric_list[:3]
-            approx_kl = metric_list[3] if len(metric_list) > 3 else 0.0
-            clip_fraction = metric_list[4] if len(metric_list) > 4 else 0.0
-            lr = self.optimizer.param_groups[0].get("lr", 0.0)
-            results.update(
-                {
-                    "value_loss": round(value_loss, 4),
-                    "policy_loss": round(policy_loss, 4),
-                    "entropy_loss": round(entropy_loss, 4),
-                    "approx_kl": round(approx_kl, 6),
-                    "clip_fraction": round(clip_fraction, 4),
-                    "learning_rate": round(lr, 8),
-                    "grad_norm": round(float(grad_norm), 4) if "grad_norm" in locals() else 0.0,
-                    "entropy_beta": round(float(getattr(self.model, "var_beta", 0.0)), 6),
-                    "ppo_clip": round(float(getattr(self.model, "clip_param", 0.0)), 4),
-                }
-            )
             if self.monitor:
                 self.monitor.put_data({os.getpid(): results})
             self.last_report_monitor_time = now

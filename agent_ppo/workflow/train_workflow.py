@@ -14,7 +14,7 @@ from agent_ppo.feature.definition import (
     build_frame,
     FrameCollector,
     NONE_ACTION,
-    lineup_iterator_roundrobin_camp_heroes,
+    lineup_iterator_from_pairs,
 )
 from agent_ppo.conf.conf import GameConfig
 from tools.env_conf_manager import EnvConfManager
@@ -55,11 +55,22 @@ LEARNER_ONLY_KEYS = {
     "feature_nan_count",
 }
 
+MATCHUP_PAIRS = [(112, 112), (112, 133), (133, 112), (133, 133)]
+MATCHUP_MONITOR_KEYS = []
+for _my_hero_id, _enemy_hero_id in MATCHUP_PAIRS:
+    _prefix = f"matchup_{_my_hero_id}_vs_{_enemy_hero_id}"
+    MATCHUP_MONITOR_KEYS.extend([
+        f"{_prefix}_game",
+        f"{_prefix}_win",
+        f"{_prefix}_win_rate",
+        f"{_prefix}_game_total",
+    ])
+
 NEW_MONITOR_KEYS = [
     # environment
     "reward", "episode_cnt", "frame_no", "win",
     "my_hp", "enemy_hp", "own_tower_hp_ratio", "enemy_tower_hp_ratio",
-    "kill_count", "death_count", "cake_count", "neutral_count", "opponent_type",
+    "kill_count", "death_count", "cake_count", "neutral_count",
 
     # ppo / learner
     "total_loss", "value_loss", "policy_loss", "entropy_loss",
@@ -73,7 +84,7 @@ NEW_MONITOR_KEYS = [
     "tower_hp_point", "kill", "death",
     "money", "exp", "last_hit",
     "hp_point", "hero_hurt", "hero_damage", "total_damage",
-    "lane_clear", "defense", "cake",
+    "lane_clear", "defense", "cake", "forward",
     "tower_risk", "stuck", "no_ops", "grass_behavior",
     "skill_hit", "crit", "in_grass", "under_tower_behavior", "passive_skills",
 
@@ -87,7 +98,7 @@ NEW_MONITOR_KEYS = [
     "skill_target_enemy_rate", "skill_target_soldier_rate", "skill_target_tower_rate", "skill_center_rate",
     "stuck_count", "grass_long_stay_count", "grass_no_effective_count", "unsafe_tower_entry_count",
     "own_cake_pick_count", "low_hp_own_cake_approach_count",
-]
+] + MATCHUP_MONITOR_KEYS
 
 
 def _dedup_keys(keys):
@@ -103,6 +114,7 @@ MONITOR_KEYS = _dedup_keys(OLD_D401_KEYS + NEW_MONITOR_KEYS)
 # These keys should be averaged over the episode if emitted per decision frame.
 AVG_MONITOR_KEYS = {
     "my_hp", "enemy_hp", "own_tower_hp_ratio", "enemy_tower_hp_ratio",
+    "in_grass", "under_tower_behavior",
     "enemy_soldier_count", "friendly_soldier_count",
     "enemy_soldier_near_own_tower_count",
     "target_soldier_rate", "target_enemy_rate", "target_tower_rate", "target_monster_rate",
@@ -118,7 +130,7 @@ REWARD_GROUPS_FOR_MONITOR = {
         "total_damage", "hero_damage", "skill_hit",
     ],
     "reward_behavior_safety": [
-        "lane_clear", "defense", "cake", "tower_risk", "stuck",
+        "lane_clear", "defense", "cake", "forward", "tower_risk", "stuck",
         "no_ops", "grass_behavior",
     ],
 }
@@ -138,7 +150,13 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
 
     # Lineup iterator (112:Luban, 133:DiRenjie)
     # 阵容迭代器 (112:鲁班， 133:狄仁杰)
-    lineup_iterator = lineup_iterator_roundrobin_camp_heroes([112, 133])
+    lineup_mode = getattr(GameConfig, "TRAIN_LINEUP_MODE", "all_matchups")
+    lineup_pairs = getattr(GameConfig, "TRAIN_LINEUP_PAIRS", {}).get(lineup_mode)
+    if not lineup_pairs:
+        lineup_pairs = [(112, 112), (112, 133), (133, 112), (133, 133)]
+    lineup_iterator = lineup_iterator_from_pairs(lineup_pairs)
+    if logger:
+        logger.info(f"lineup_mode={lineup_mode}, lineup_pairs={lineup_pairs}")
 
     # Create EpisodeRunner instance
     # 创建 EpisodeRunner 实例
@@ -179,7 +197,12 @@ class EpisodeRunner:
         self.agent_num = len(agents)
         self.episode_cnt = 0
         self.last_report_monitor_time = 0
+        self.last_training_metric_log_time = 0
         self.latest_training_metrics = {}
+        self.matchup_stats = {
+            f"matchup_{my_hero_id}_vs_{enemy_hero_id}": {"game": 0.0, "win": 0.0}
+            for my_hero_id, enemy_hero_id in MATCHUP_PAIRS
+        }
 
     @staticmethod
     def _safe_float(value):
@@ -268,35 +291,108 @@ class EpisodeRunner:
                 out[group_key] = sum(out.get(item_key, 0.0) for item_key in item_keys)
         return out
 
-    def _extract_env_monitor_items(self, frame_state, monitor_side):
+    @classmethod
+    def _episode_win_value(cls, observation, report_side, terminated, truncated, is_train_test_timeout):
+        """Use env win when available; use 0.5 for timeout-like exits."""
+        if truncated or is_train_test_timeout:
+            return 0.5
+        try:
+            side_obs = observation.get(str(report_side), {}) if isinstance(observation, dict) else {}
+            if "win" in side_obs:
+                return 1.0 if cls._safe_float(side_obs.get("win", 0.0)) > 0.5 else 0.0
+        except Exception:
+            pass
+        if terminated:
+            return 0.0
+        return 0.5
+
+    @staticmethod
+    def _matchup_monitor_items(lineup, report_side, win_value):
+        data = {}
+        try:
+            if not isinstance(lineup, (list, tuple)) or len(lineup) < 2:
+                return data
+            side = int(report_side)
+            if side not in (0, 1):
+                side = 0
+            my_hero = int(lineup[side])
+            enemy_hero = int(lineup[1 - side])
+            prefix = f"matchup_{my_hero}_vs_{enemy_hero}"
+            data[f"{prefix}_game"] = 1.0
+            data[f"{prefix}_win"] = float(win_value)
+        except Exception:
+            pass
+        return data
+
+    def _record_matchup_result(self, lineup, report_side, win_value):
+        try:
+            if not isinstance(lineup, (list, tuple)) or len(lineup) < 2:
+                return
+            side = int(report_side)
+            if side not in (0, 1):
+                side = 0
+            prefix = f"matchup_{int(lineup[side])}_vs_{int(lineup[1 - side])}"
+            if prefix not in self.matchup_stats:
+                self.matchup_stats[prefix] = {"game": 0.0, "win": 0.0}
+            self.matchup_stats[prefix]["game"] += 1.0
+            self.matchup_stats[prefix]["win"] += float(win_value)
+        except Exception:
+            pass
+
+    def _matchup_rate_monitor_items(self):
+        data = {}
+        for my_hero_id, enemy_hero_id in MATCHUP_PAIRS:
+            prefix = f"matchup_{my_hero_id}_vs_{enemy_hero_id}"
+            stat = self.matchup_stats.get(prefix, {"game": 0.0, "win": 0.0})
+            game = float(stat.get("game", 0.0))
+            win = float(stat.get("win", 0.0))
+            data[f"{prefix}_game_total"] = game
+            data[f"{prefix}_win_rate"] = win / game if game > 0 else 0.0
+        return data
+
+    def _extract_env_monitor_items(self, obs):
         """Extract low-cost environment metrics for panels."""
         data = {}
         try:
+            if not isinstance(obs, dict):
+                return data
+            frame_state = obs.get("frame_state", {}) or {}
             hero_states = frame_state.get("hero_states", [])
             npc_states = frame_state.get("npc_states", [])
-            main_camp = None
-            my_hero = None
+            my_hero = self._get_main_hero_from_obs(obs)
+            if my_hero is None:
+                return data
+
+            obs_camp = obs.get("camp", obs.get("player_camp", None))
+            main_camp = obs_camp if obs_camp is not None else my_hero.get("camp", None)
+            if main_camp is not None and my_hero.get("camp", None) != main_camp:
+                for hero in hero_states:
+                    if hero.get("camp", None) == main_camp:
+                        my_hero = hero
+                        break
             enemy_hero = None
             for hero in hero_states:
-                # reward manager main camp is based on agent; monitor_side observation is already local.
-                # Here use the first matching runtime from observation perspective when possible.
-                if my_hero is None:
-                    my_hero = hero
-                    main_camp = hero.get("camp", None)
-                elif hero.get("camp") != main_camp:
+                if hero is not my_hero and hero.get("camp") != main_camp:
                     enemy_hero = hero
+                    break
             if my_hero:
                 data["my_hp"] = self._safe_float(my_hero.get("hp", 0)) / max(1.0, self._safe_float(my_hero.get("max_hp", 1)))
                 data["kill_count"] = self._safe_float(my_hero.get("kill_cnt", 0))
                 data["death_count"] = self._safe_float(my_hero.get("dead_cnt", 0))
+                data["in_grass"] = 1.0 if bool(my_hero.get("is_in_grass", False)) else 0.0
             if enemy_hero:
                 data["enemy_hp"] = self._safe_float(enemy_hero.get("hp", 0)) / max(1.0, self._safe_float(enemy_hero.get("max_hp", 1)))
             own_tower = None
             enemy_tower = None
+            friendly_soldier_ids = set()
+            enemy_soldier_ids = set()
+            enemy_soldiers_near_own_tower = 0
             friendly_soldiers = 0
             enemy_soldiers = 0
+            neutral_count = 0
             for npc in npc_states:
                 sub_type = int(npc.get("sub_type", -1))
+                config_id = int(self._safe_float(npc.get("config_id", npc.get("configId", -1))))
                 hp = self._safe_float(npc.get("hp", 0))
                 if hp <= 0:
                     continue
@@ -308,14 +404,63 @@ class EpisodeRunner:
                 elif sub_type == 11:
                     if npc.get("camp") == main_camp:
                         friendly_soldiers += 1
+                        friendly_soldier_ids.add(npc.get("runtime_id"))
                     else:
                         enemy_soldiers += 1
+                        enemy_soldier_ids.add(npc.get("runtime_id"))
+                elif config_id in getattr(GameConfig, "MONSTER_CONFIG_IDS", set()):
+                    neutral_count += 1
             if own_tower:
                 data["own_tower_hp_ratio"] = self._safe_float(own_tower.get("hp", 0)) / max(1.0, self._safe_float(own_tower.get("max_hp", 1)))
             if enemy_tower:
                 data["enemy_tower_hp_ratio"] = self._safe_float(enemy_tower.get("hp", 0)) / max(1.0, self._safe_float(enemy_tower.get("max_hp", 1)))
+            if own_tower:
+                tower_loc = own_tower.get("location", {}) or {}
+                tx = self._safe_float(tower_loc.get("x", 0))
+                tz = self._safe_float(tower_loc.get("z", 0))
+                tower_range = self._safe_float(own_tower.get("attack_range", 8800)) * 1.15
+                for npc in npc_states:
+                    if npc.get("runtime_id") not in enemy_soldier_ids:
+                        continue
+                    loc = npc.get("location", {}) or {}
+                    dx = self._safe_float(loc.get("x", 0)) - tx
+                    dz = self._safe_float(loc.get("z", 0)) - tz
+                    if (dx * dx + dz * dz) ** 0.5 <= tower_range:
+                        enemy_soldiers_near_own_tower += 1
+
+            own_tower_target = own_tower.get("attack_target", 0) if own_tower else 0
+            enemy_tower_target = enemy_tower.get("attack_target", 0) if enemy_tower else 0
+            own_tower_target_enemy_soldier = 1.0 if own_tower_target in enemy_soldier_ids else 0.0
+            defense_emergency = 1.0 if own_tower_target_enemy_soldier > 0 or enemy_soldiers_near_own_tower > 0 else 0.0
+
+            unsafe_tower_entry = 0.0
+            under_tower_behavior = 0.0
+            if enemy_tower:
+                hero_loc = my_hero.get("location", {}) or {}
+                tower_loc = enemy_tower.get("location", {}) or {}
+                dx = self._safe_float(hero_loc.get("x", 0)) - self._safe_float(tower_loc.get("x", 0))
+                dz = self._safe_float(hero_loc.get("z", 0)) - self._safe_float(tower_loc.get("z", 0))
+                enemy_tower_range = self._safe_float(enemy_tower.get("attack_range", 8800))
+                in_enemy_tower = (dx * dx + dz * dz) ** 0.5 <= enemy_tower_range
+                friendly_tanking = enemy_tower_target in friendly_soldier_ids
+                tower_target_me = enemy_tower_target == my_hero.get("runtime_id")
+                unsafe_tower_entry = 1.0 if (in_enemy_tower and not friendly_tanking) or tower_target_me else 0.0
+                if tower_target_me:
+                    under_tower_behavior = -2.0
+                elif in_enemy_tower and not friendly_tanking:
+                    under_tower_behavior = -1.0
+                elif in_enemy_tower and friendly_tanking:
+                    under_tower_behavior = 0.5
+
             data["friendly_soldier_count"] = friendly_soldiers
             data["enemy_soldier_count"] = enemy_soldiers
+            data["enemy_soldier_near_own_tower_count"] = enemy_soldiers_near_own_tower
+            data["own_tower_target_enemy_soldier_count"] = own_tower_target_enemy_soldier
+            data["defense_emergency_count"] = defense_emergency
+            data["unsafe_tower_entry_count"] = unsafe_tower_entry
+            data["under_tower_behavior"] = under_tower_behavior
+            data["cake_count"] = len(frame_state.get("cakes", []) or [])
+            data["neutral_count"] = neutral_count
         except Exception:
             pass
         return data
@@ -603,12 +748,15 @@ class EpisodeRunner:
             training_metrics = get_training_metrics()
             if training_metrics:
                 self.latest_training_metrics = self._flatten_training_metrics(training_metrics)
-                for key, value in training_metrics.items():
-                    if key == "env" and isinstance(value, dict):
-                        for env_key, env_value in value.items():
-                            self.logger.info(f"training_metrics {key} {env_key} is {env_value}")
-                    else:
-                        self.logger.info(f"training_metrics {key} is {value}")
+                now = time.time()
+                if self.logger and now - self.last_training_metric_log_time >= 60:
+                    compact_metrics = {
+                        key: round(self._safe_float(self.latest_training_metrics.get(key, 0.0)), 6)
+                        for key in sorted(LEARNER_ONLY_KEYS)
+                        if key in self.latest_training_metrics
+                    }
+                    self.logger.info(f"training_metrics summary {compact_metrics}")
+                    self.last_training_metric_log_time = now
 
             # Update environment configuration
             # Can use a list of length 2 to pass in the lineup id of the current game
@@ -667,7 +815,7 @@ class EpisodeRunner:
                     observation[str(i)]["reward"] = reward
                     reward_sum_list[i] += self._safe_float(reward.get("reward_sum", 0.0))
                     self._accumulate_monitor_items(monitor_acc_list[i], reward)
-                    self._accumulate_monitor_items(monitor_acc_list[i], self._extract_env_monitor_items(frame_state, i))
+                    self._accumulate_monitor_items(monitor_acc_list[i], self._extract_env_monitor_items(observation[str(i)]))
                     self._accumulate_monitor_items(
                         monitor_acc_list[i],
                         self._extract_history_behavior_monitor_items(observation[str(i)], behavior_state_list[i]),
@@ -697,12 +845,6 @@ class EpisodeRunner:
                         action_monitor = self._extract_action_monitor_items(actions[index])
                         self._accumulate_monitor_items(monitor_acc_list[index], action_monitor)
 
-                        if self.episode_cnt <= 2 and frame_no < 500 and index == monitor_side and self.logger:
-                            self.logger.info(
-                                f"[ACTION_DEBUG] side={index} do_predict={do_predict} do_sample={do_sample} "
-                                f"raw={actions[index]} flat={self._flatten_action(actions[index])}"
-                            )
-
                         # Only sample when do_sample=True and is_eval=False
                         # 评估对局数据不采样，不是训练中最新模型产生的数据不采样
                         if not is_eval and do_sample:
@@ -731,7 +873,7 @@ class EpisodeRunner:
                         observation[str(i)]["reward"] = reward
                         reward_sum_list[i] += self._safe_float(reward.get("reward_sum", 0.0))
                         self._accumulate_monitor_items(monitor_acc_list[i], reward)
-                        self._accumulate_monitor_items(monitor_acc_list[i], self._extract_env_monitor_items(frame_state, i))
+                        self._accumulate_monitor_items(monitor_acc_list[i], self._extract_env_monitor_items(observation[str(i)]))
                         self._accumulate_monitor_items(
                             monitor_acc_list[i],
                             self._extract_history_behavior_monitor_items(observation[str(i)], behavior_state_list[i]),
@@ -757,23 +899,33 @@ class EpisodeRunner:
                                 reward=observation[str(i)]["reward"].get("reward_sum", 0.0),
                             )
 
+                    # If monitor_side is common_ai / non-predict side, switch reporting to a predicted side.
+                    report_side = monitor_side
+                    if report_side >= len(self.do_predicts) or not self.do_predicts[report_side]:
+                        for side_idx, flag in enumerate(self.do_predicts):
+                            if flag:
+                                report_side = side_idx
+                                break
+                    win_value = self._episode_win_value(
+                        observation,
+                        report_side,
+                        terminated,
+                        truncated,
+                        (not terminated) and (not truncated) and is_train_test and frame_no >= 1000,
+                    )
+                    self._record_matchup_result(lineup, report_side, win_value)
+
                     now = time.time()
                     if now - self.last_report_monitor_time >= 60:
-                        # If monitor_side is common_ai / non-predict side, switch reporting to a predicted side.
-                        report_side = monitor_side
-                        if report_side >= len(self.do_predicts) or not self.do_predicts[report_side]:
-                            for side_idx, flag in enumerate(self.do_predicts):
-                                if flag:
-                                    report_side = side_idx
-                                    break
-
                         monitor_data = self._finalize_monitor_items(monitor_acc_list[report_side])
                         monitor_data.update({
                             "episode_cnt": self.episode_cnt,
                             "frame_no": frame_no,
                             "reward": round(reward_sum_list[report_side], 2),
-                            "win": 1.0 if self._safe_float(reward_sum_list[report_side]) > 0 else 0.0,
+                            "win": win_value,
                         })
+                        monitor_data.update(self._matchup_monitor_items(lineup, report_side, win_value))
+                        monitor_data.update(self._matchup_rate_monitor_items())
 
                         # Merge learner-side PPO metrics.
                         # IMPORTANT: monitor panels with multiple lines expect every metric to be present

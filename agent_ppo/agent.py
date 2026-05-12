@@ -21,7 +21,7 @@ from agent_ppo.feature.definition import *
 import numpy as np
 from kaiwudrl.interface.agent import BaseAgent
 
-from agent_ppo.conf.conf import Config
+from agent_ppo.conf.conf import Config, GameConfig
 from agent_ppo.feature.reward_process import GameRewardManager
 from torch.optim.lr_scheduler import LambdaLR
 from agent_ppo.algorithm.algorithm import Algorithm
@@ -84,6 +84,7 @@ class Agent(BaseAgent):
         self.reward_manager = None
         self.logger = logger
         self.monitor = monitor
+        self._mask_debug_logged = False
 
         self.algorithm = Algorithm(self.model, self.optimizer, self.scheduler, self.device, self.logger, self.monitor)
 
@@ -110,16 +111,25 @@ class Agent(BaseAgent):
         # 根据双方阵营英雄阵容，为己方每个英雄选择召唤师技能
         my_heroes = config_data.get("my_heroes", [])
         select_skills = {}
+        policy = getattr(GameConfig, "SUMMONER_SKILL_POLICY", "fixed_flash")
         for hero_id in my_heroes:
-            skill_id = random.choice(SUMMONER_SKILL_IDS)
+            if policy == "fixed_flash":
+                skill_id = GameConfig.HERO_SUMMONER_SKILL_IDS.get(
+                    hero_id,
+                    GameConfig.DEFAULT_SUMMONER_SKILL_ID,
+                )
+            elif policy == "safe_random":
+                skill_id = random.choice(list(getattr(GameConfig, "SAFE_SUMMONER_SKILL_IDS", [80115])))
+            else:
+                skill_id = random.choice(SUMMONER_SKILL_IDS)
             select_skills[hero_id] = skill_id
         return select_skills
 
     def reset(self, observation):
         # Reset function, called at the beginning of each episode
         # 重置函数，每局开始时调用
-        self.hero_camp = observation["camp"]
-        self.player_id = observation["player_id"]
+        self.hero_camp = observation.get("camp", observation.get("player_camp", 0))
+        self.player_id = observation.get("player_id", observation.get("runtime_id", 0))
         self.lstm_hidden = np.zeros([self.lstm_unit_size])
         self.lstm_cell = np.zeros([self.lstm_unit_size])
         self.reward_manager = GameRewardManager(self.player_id)
@@ -200,6 +210,36 @@ class Agent(BaseAgent):
         return d_action
 
     def observation_process(self, observation):
+        if not self._mask_debug_logged:
+            legal_action = observation.get("legal_action", [])
+            sub_action_mask = observation.get("sub_action_mask", {})
+            if isinstance(sub_action_mask, dict):
+                sub_action_desc = {
+                    "type": "dict",
+                    "key_count": len(sub_action_mask),
+                    "sample_keys": list(sub_action_mask.keys())[:5],
+                }
+            elif isinstance(sub_action_mask, (list, tuple)):
+                sub_action_desc = {
+                    "type": type(sub_action_mask).__name__,
+                    "length": len(sub_action_mask),
+                }
+            else:
+                sub_action_desc = {"type": type(sub_action_mask).__name__}
+
+            msg = (
+                "[MASK_DEBUG] "
+                f"env_id={observation.get('env_id', '')}, "
+                f"player_id={observation.get('player_id', '')}, "
+                f"camp={observation.get('camp', observation.get('player_camp', ''))}, "
+                f"legal_action_len={len(legal_action)}, "
+                "expected_folded=85, expected_expanded=184, "
+                f"sub_action_mask={sub_action_desc}"
+            )
+            if self.logger:
+                self.logger.info(msg)
+            self._mask_debug_logged = True
+
         feature = self.feature_processes.process_feature(observation)
         feature_vec, legal_action = (
             feature,
@@ -285,6 +325,19 @@ class Agent(BaseAgent):
         unsafe_tower_entry = float(context.get("unsafe_tower_entry", 0.0)) > 0.5
         my_hp_ratio = float(context.get("my_hp_ratio", 1.0))
         own_cake_exists = float(context.get("own_cake_exists", 0.0)) > 0.5
+        opening_move = float(context.get("opening_move", 0.0)) > 0.5
+        enemy_tower_dx = float(context.get("enemy_tower_dx", 0.0))
+        enemy_tower_dz = float(context.get("enemy_tower_dz", 0.0))
+
+        def bias_axis_towards(arr, delta, strength=0.25):
+            center = 8
+            target = center
+            if abs(delta) > 1000:
+                target = 10 if delta > 0 else 6
+            for idx, val in ((target, strength), (target - 1, strength * 0.5), (target + 1, strength * 0.5)):
+                add(arr, idx, val)
+
+        add(button_logits, GameConfig.BUTTON_INVALID, -2.0)
 
         # Skill offset should initially aim near target center.
         center = 8
@@ -305,12 +358,25 @@ class Agent(BaseAgent):
             add(target_logits, GameConfig.TARGET_ENEMY, -1.0)
             add(button_logits, GameConfig.BUTTON_SKILL3, -1.0)
 
+        # At the beginning of an episode there is often no visible target yet.
+        # Encourage leaving spawn and walking toward the enemy side instead of
+        # learning that idle/passive income is acceptable.
+        if opening_move and (not enemy_visible) and enemy_soldier_count <= 0 and not defense_emergency:
+            add(button_logits, GameConfig.BUTTON_MOVE, 1.0)
+            add(button_logits, GameConfig.BUTTON_NONE, -0.8)
+            add(button_logits, GameConfig.BUTTON_RECALL, -1.0)
+            add(button_logits, GameConfig.BUTTON_ATTACK, -0.2)
+            bias_axis_towards(move_x_logits, enemy_tower_dx, strength=0.25)
+            bias_axis_towards(move_z_logits, enemy_tower_dz, strength=0.25)
+
         # Stuck / grass anti-idle bias.
         if stuck_score > 0.5 or (is_in_grass and grass_no_effective_steps > 6):
-            add(button_logits, GameConfig.BUTTON_MOVE, 0.8)
+            add(button_logits, GameConfig.BUTTON_MOVE, 1.2)
             add(button_logits, GameConfig.BUTTON_ATTACK, 0.3)
-            add(button_logits, GameConfig.BUTTON_NONE, -1.0)
+            add(button_logits, GameConfig.BUTTON_NONE, -1.2)
             add(button_logits, GameConfig.BUTTON_RECALL, -1.0)
+            bias_axis_towards(move_x_logits, enemy_tower_dx, strength=0.2)
+            bias_axis_towards(move_z_logits, enemy_tower_dz, strength=0.2)
 
         # Low-hp cake bias: only movement; own-cake direction should be handled by move feature.
         if my_hp_ratio < 0.4 and own_cake_exists:

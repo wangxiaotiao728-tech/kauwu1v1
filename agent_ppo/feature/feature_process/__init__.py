@@ -221,7 +221,7 @@ def _is_visible_to(hero: Any, camp: int) -> bool:
 class FeatureProcess:
     def __init__(self, camp):
         self.main_camp = camp
-        self.last_enemy_seen = {"x": 0.0, "z": 0.0, "frame": 0, "hp": 0.0}
+        self.last_enemy_seen = {"x": 0.0, "z": 0.0, "frame": 0, "hp": 1.0}
         self.last_self_pos: Optional[Tuple[float, float]] = None
         self.same_position_steps = 0
         self.no_real_cmd_steps = 0
@@ -232,6 +232,8 @@ class FeatureProcess:
         self.prev_slot_hit = {}
         self.prev_total_hurt = 0.0
         self.prev_enemy_total_hurt = 0.0
+        self.last_own_tower_seen = {"x": 0.0, "z": 0.0, "frame": 0, "hp": 1.0}
+        self.last_enemy_tower_seen = {"x": 0.0, "z": 0.0, "frame": 0, "hp": 1.0}
         self.last_context: Dict[str, float] = {}
 
     def reset(self):
@@ -294,6 +296,36 @@ class FeatureProcess:
         remaining = [item for item in cakes if item is not own_item]
         enemy_item = min(remaining, key=lambda item: _dist_loc(item[1], enemy_pos)) if remaining else None
         return own_item, enemy_item
+
+    def _update_tower_cache(self, cache_name: str, tower: Any, frame_no: int):
+        if tower is None:
+            return
+        pos = _loc(tower)
+        cache = getattr(self, cache_name)
+        cache.update({"x": pos["x"], "z": pos["z"], "frame": frame_no, "hp": _hp_rate(tower)})
+
+    def _fallback_enemy_tower_pos(self, own_tower: Any) -> Dict[str, float]:
+        if self.last_enemy_tower_seen.get("frame", 0) > 0:
+            return {"x": self.last_enemy_tower_seen["x"], "z": self.last_enemy_tower_seen["z"]}
+        if own_tower is not None:
+            own_pos = _loc(own_tower)
+            return {"x": -own_pos["x"], "z": -own_pos["z"]}
+        if self.last_own_tower_seen.get("frame", 0) > 0:
+            return {"x": -self.last_own_tower_seen["x"], "z": -self.last_own_tower_seen["z"]}
+        return {"x": 0.0, "z": 0.0}
+
+    def _tower_ref(self, tower: Any, cache: Dict[str, float], fallback_pos: Dict[str, float], camp: Any):
+        if tower is not None:
+            return tower
+        return {
+            "location": {"x": fallback_pos["x"], "z": fallback_pos["z"]},
+            "hp": float(cache.get("hp", 1.0)),
+            "max_hp": 1.0,
+            "attack_range": 8800,
+            "attack_target": 0,
+            "runtime_id": None,
+            "camp": camp,
+        }
 
     def _append_pad(self, values: List[float], size: int) -> List[float]:
         values = [float(0.0 if (isinstance(v, float) and (math.isnan(v) or math.isinf(v))) else v) for v in values]
@@ -663,28 +695,54 @@ class FeatureProcess:
         soldiers, towers, monsters = self._split_npcs(frame_state)
         own_tower, enemy_tower = self._find_towers(towers)
         friendly_soldiers, enemy_soldiers = self._split_soldiers(soldiers)
-        own_cake, enemy_cake = self._split_cakes(frame_state, own_tower, enemy_tower)
+        self._update_tower_cache("last_own_tower_seen", own_tower, frame_no)
+        self._update_tower_cache("last_enemy_tower_seen", enemy_tower, frame_no)
+        own_tower_pos = (
+            _loc(own_tower)
+            if own_tower is not None
+            else {"x": self.last_own_tower_seen["x"], "z": self.last_own_tower_seen["z"]}
+        )
+        enemy_tower_pos = _loc(enemy_tower) if enemy_tower is not None else self._fallback_enemy_tower_pos(own_tower)
+        enemy_camp = 2 if self.main_camp == 1 else 1 if self.main_camp == 2 else None
+        own_tower_ref = self._tower_ref(own_tower, self.last_own_tower_seen, own_tower_pos, self.main_camp)
+        enemy_tower_ref = self._tower_ref(enemy_tower, self.last_enemy_tower_seen, enemy_tower_pos, enemy_camp)
+        own_cake, enemy_cake = self._split_cakes(frame_state, own_tower_ref, enemy_tower_ref)
         lane_visible = len(friendly_soldiers) + len(enemy_soldiers) > 0
+        main_pos = _loc(main_hero)
+        enemy_tower_dx = enemy_tower_pos["x"] - main_pos["x"]
+        enemy_tower_dz = enemy_tower_pos["z"] - main_pos["z"]
+        enemy_tower_dist = _dist_actor(main_hero, enemy_tower_ref)
+        enemy_tower_target = _get_any(enemy_tower_ref, "attack_target", default=0)
+        friendly_ids = set(_runtime_id(s) for s in friendly_soldiers)
+        friendly_tanking_enemy_tower = enemy_tower is not None and enemy_tower_target in friendly_ids
+        enemy_tower_range = float(_get_any(enemy_tower_ref, "attack_range", default=8800) or 8800)
+        in_enemy_tower = enemy_tower_dist <= enemy_tower_range
+        unsafe_tower_entry = in_enemy_tower and not friendly_tanking_enemy_tower
+        tower_target_me = enemy_tower is not None and enemy_tower_target == _runtime_id(main_hero)
 
         self.last_context = {
             "enemy_visible": 1.0 if enemy_hero is not None and _is_visible_to(enemy_hero, self.main_camp) else 0.0,
             "enemy_dist": _dist_actor(main_hero, enemy_hero) if enemy_hero is not None else DIST_NORM,
             "enemy_soldier_count": float(len(enemy_soldiers)),
             "friendly_soldier_count": float(len(friendly_soldiers)),
-            "friendly_soldier_tanking_enemy_tower": 1.0 if enemy_tower is not None and _get_any(enemy_tower, "attack_target", default=0) in set(_runtime_id(s) for s in friendly_soldiers) else 0.0,
-            "unsafe_tower_entry": 0.0,
+            "friendly_soldier_tanking_enemy_tower": 1.0 if friendly_tanking_enemy_tower else 0.0,
+            "unsafe_tower_entry": 1.0 if unsafe_tower_entry or tower_target_me else 0.0,
             "own_cake_exists": 1.0 if own_cake is not None else 0.0,
             "my_hp_ratio": _hp_rate(main_hero),
+            "enemy_tower_dx": enemy_tower_dx,
+            "enemy_tower_dz": enemy_tower_dz,
+            "enemy_tower_dist": enemy_tower_dist,
+            "opening_move": 1.0 if frame_no < 3000 and (not lane_visible) and _hp_rate(main_hero) > 0.55 else 0.0,
         }
 
         groups = [
-            self._extract_self_group(frame_no, main_hero, enemy_hero, friendly_soldiers, enemy_soldiers, own_tower, enemy_tower),
-            self._extract_enemy_group(frame_no, main_hero, enemy_hero, friendly_soldiers, enemy_soldiers, own_tower, enemy_tower),
+            self._extract_self_group(frame_no, main_hero, enemy_hero, friendly_soldiers, enemy_soldiers, own_tower_ref, enemy_tower_ref),
+            self._extract_enemy_group(frame_no, main_hero, enemy_hero, friendly_soldiers, enemy_soldiers, own_tower_ref, enemy_tower_ref),
             self._extract_skill_group(main_hero),
-            self._extract_lane_group(main_hero, friendly_soldiers, enemy_soldiers, own_tower, enemy_tower),
-            self._extract_objective_group(frame_no, main_hero, enemy_hero, friendly_soldiers, enemy_soldiers, own_tower, enemy_tower, monsters, own_cake, enemy_cake),
-            self._extract_target_group(main_hero, enemy_hero, friendly_soldiers, enemy_soldiers, own_tower, enemy_tower, monsters),
-            self._extract_history_group(frame_no, main_hero, enemy_hero, friendly_soldiers, enemy_soldiers, own_tower, enemy_tower, lane_visible),
+            self._extract_lane_group(main_hero, friendly_soldiers, enemy_soldiers, own_tower_ref, enemy_tower_ref),
+            self._extract_objective_group(frame_no, main_hero, enemy_hero, friendly_soldiers, enemy_soldiers, own_tower_ref, enemy_tower_ref, monsters, own_cake, enemy_cake),
+            self._extract_target_group(main_hero, enemy_hero, friendly_soldiers, enemy_soldiers, own_tower_ref, enemy_tower_ref, monsters),
+            self._extract_history_group(frame_no, main_hero, enemy_hero, friendly_soldiers, enemy_soldiers, own_tower_ref, enemy_tower_ref, lane_visible),
         ]
         feature = []
         for g in groups:

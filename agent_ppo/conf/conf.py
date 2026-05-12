@@ -33,19 +33,21 @@ class GameConfig:
     CAKE_LOW_HP_THRESHOLD = 0.40
     CAKE_MEDIUM_HP_THRESHOLD = 0.60
 
-    # Button ids are environment dependent. These defaults match the common 1v1
-    # baseline layout used by this starter: None, Move, Attack, Skill1, Skill2,
-    # Skill3, Recover, Summoner, Recall. If your local action definition differs,
-    # change only these constants.
-    BUTTON_NONE = 0
-    BUTTON_MOVE = 1
-    BUTTON_ATTACK = 2
-    BUTTON_SKILL1 = 3
-    BUTTON_SKILL2 = 4
-    BUTTON_SKILL3 = 5
-    BUTTON_RECOVER = 6
-    BUTTON_SUMMONER = 7
-    BUTTON_RECALL = 8
+    # Button ids from the HoK 1v1 action protocol:
+    # 0 invalid, 1 none, 2 move, 3 normal attack, 4-6 skills,
+    # 7 recover, 8 summoner, 9 recall, 10 skill4, 11 equipment skill.
+    BUTTON_INVALID = 0
+    BUTTON_NONE = 1
+    BUTTON_MOVE = 2
+    BUTTON_ATTACK = 3
+    BUTTON_SKILL1 = 4
+    BUTTON_SKILL2 = 5
+    BUTTON_SKILL3 = 6
+    BUTTON_RECOVER = 7
+    BUTTON_SUMMONER = 8
+    BUTTON_RECALL = 9
+    BUTTON_SKILL4 = 10
+    BUTTON_EQUIPMENT = 11
 
     TARGET_NONE = 0
     TARGET_ENEMY = 1
@@ -65,8 +67,8 @@ class GameConfig:
         "death": -1.0,
         # growth / combat
         "hp_point": 1.0,
-        "money": 0.05,
-        "exp": 0.05,
+        "money": 0.02,
+        "exp": 0.02,
         "last_hit": 0.06,
         "hero_hurt": -0.10,
         "total_damage": 0.03,
@@ -77,16 +79,16 @@ class GameConfig:
         "defense": 0.08,
         "cake": 0.05,
         "tower_risk": 0.03,
-        "stuck": -0.03,
-        "no_ops": -0.005,
+        "stuck": -0.12,
+        "no_ops": -0.03,
         "grass_behavior": 0.03,
+        "forward": 0.20,
         # disabled / monitor-only
         "bad_skill": 0.0,
         "passive_skills": 0.0,
         "crit": 0.0,
         "in_grass": 0.0,
         # optional old baseline keys kept off
-        "forward": 0.0,
         "ep_rate": 0.0,
         "monster_resource": 0.0,
     }
@@ -107,6 +109,7 @@ class GameConfig:
             "lane_clear",
             "defense",
             "cake",
+            "forward",
             "tower_risk",
             "stuck",
             "no_ops",
@@ -125,6 +128,27 @@ class GameConfig:
     DEBUG_NPC_SCAN = False
     DEBUG_NPC_SCAN_MAX_FRAME = 3000
     DEBUG_FEATURE_CHECK = False
+
+    # Training lineup curriculum.
+    # luban_priority: start with more Luban mirror games while still sampling all 4 matchups.
+    # all_matchups: balanced 112/133 x 112/133.
+    # luban_mirror / direnjie_mirror: single-hero debugging phases.
+    TRAIN_LINEUP_MODE = "luban_priority"
+    TRAIN_LINEUP_PAIRS = {
+        "luban_mirror": [(112, 112)],
+        "direnjie_mirror": [(133, 133)],
+        "all_matchups": [(112, 112), (112, 133), (133, 112), (133, 133)],
+        "luban_priority": [(112, 112), (112, 112), (112, 112), (133, 133), (112, 133), (133, 112)],
+    }
+
+    # Keep summoner skill fixed in the early curriculum to reduce exploration noise.
+    SUMMONER_SKILL_POLICY = "fixed_flash"
+    DEFAULT_SUMMONER_SKILL_ID = 80115
+    HERO_SUMMONER_SKILL_IDS = {
+        112: 80115,
+        133: 80115,
+    }
+    SAFE_SUMMONER_SKILL_IDS = [80115, 80102, 80109]
 
 
 class DimConfig:
@@ -164,18 +188,19 @@ class Config:
 
     # LR schedule: warmup to BASE_LR, then cosine decay. The existing Agent uses
     # LambdaLR, so these values are consumed in Agent.lr_lambda.
-    INIT_LEARNING_RATE_START = 1e-4
-    WARMUP_LR = 3e-5
-    WARMUP_STEPS = 3000
-    MIN_LR = 3e-5
+    INIT_LEARNING_RATE_START = 8e-5
+    WARMUP_LR = 2e-5
+    WARMUP_STEPS = 5000
+    MIN_LR = 2e-5
     TARGET_LR = MIN_LR
-    TARGET_STEP = 120000
+    TARGET_STEP = 180000
 
-    BETA_START = 0.015
-    TARGET_BETA = 0.005
+    BETA_START = 0.02
+    TARGET_BETA = 0.003
+    BETA_HOLD_STEPS = 10000
     LOG_EPSILON = 1e-6
     CLIP_PARAM = 0.18
-    TARGET_CLIP_PARAM = 0.12
+    TARGET_CLIP_PARAM = 0.10
     PPO_EPOCH = 1
 
     USE_DUAL_CLIP = True

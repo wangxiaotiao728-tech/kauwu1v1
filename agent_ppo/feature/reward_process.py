@@ -62,6 +62,22 @@ def _alive(actor):
     return float(_get_any(actor, "hp", default=0) or 0) > 0
 
 
+def _is_visible_to(actor, camp):
+    if actor is None:
+        return False
+    visible = _get_any(actor, "camp_visible", "campVisible", default=None)
+    if isinstance(visible, list) and len(visible) >= 2:
+        try:
+            idx = 0 if int(camp) == 1 else 1
+            return bool(visible[idx])
+        except Exception:
+            return True
+    loc = _loc(actor)
+    if abs(loc["x"]) > 90000 or abs(loc["z"]) > 90000:
+        return False
+    return True
+
+
 def _runtime_id(actor):
     return _get_any(actor, "runtime_id", "runtimeId", default=None)
 
@@ -110,6 +126,9 @@ class GameRewardManager:
         self.prev_enemy_soldier_count = 0
         self.prev_friendly_soldier_count = 0
         self.prev_near_own_enemy_soldier_count = 0
+        self.prev_enemy_soldier_ids = set()
+        self.prev_friendly_soldier_ids = set()
+        self.prev_lane_visible = False
         self.last_self_pos = None
         self.no_effective_action_steps = 0
         self.grass_steps = 0
@@ -180,11 +199,35 @@ class GameRewardManager:
         self.prev[key] = cur
         return (cur - last) / max(1e-6, scale)
 
+    def _tracked_hp_rate(self, key, actor, default=1.0):
+        """Use last visible hp for fogged actors instead of treating them as dead."""
+        if actor is None:
+            return float(self.prev.get(key, default))
+        cur = _hp_rate(actor)
+        self.prev[key] = cur
+        return cur
+
+    def _tracked_dist(self, key, a, b, default=DIST_NORM):
+        """Use last visible distance when a known objective is temporarily hidden."""
+        if a is None or b is None:
+            return float(self.prev.get(key, default))
+        cur = _dist(a, b)
+        self.prev[key] = cur
+        return cur
+
     def _has_real_cmd(self, hero):
         return len(_get_any(hero, "real_cmd", default=[]) or []) > 0
 
     def _hit_any(self, hero):
         return len(_get_any(hero, "hit_target_info", default=[]) or []) > 0
+
+    def _hit_target_ids(self, hero):
+        ids = set()
+        for info in _get_any(hero, "hit_target_info", "hitTargetInfo", default=[]) or []:
+            target_id = _get_any(info, "hit_target", "hitTarget", "runtime_id", "runtimeId", default=None)
+            if target_id is not None:
+                ids.add(target_id)
+        return ids
 
     def _update_stuck_grass(self, hero, defense_emergency, enemy_soldier_reduced):
         pos = _loc(hero)
@@ -199,7 +242,9 @@ class GameRewardManager:
             self.no_effective_action_steps += 1
         else:
             self.no_effective_action_steps = 0
-        stuck = 1.0 if self.no_effective_action_steps >= 8 else 0.0
+        stuck = 0.0
+        if self.no_effective_action_steps >= 4:
+            stuck = min(1.0, (self.no_effective_action_steps - 3) / 9.0)
 
         in_grass = bool(_get_any(hero, "is_in_grass", default=False))
         grass_behavior = 0.0
@@ -260,8 +305,13 @@ class GameRewardManager:
         own_cake, enemy_cake = self._split_cakes(frame_data, own_tower, enemy_tower)
 
         # Main deltas/potentials.
-        tower_score = _hp_rate(own_tower) - _hp_rate(enemy_tower)
-        hp_score = _hp_rate(hero) - _hp_rate(enemy)
+        my_hp = _hp_rate(hero)
+        own_tower_hp = self._tracked_hp_rate("tracked_own_tower_hp", own_tower, 1.0)
+        enemy_tower_hp = self._tracked_hp_rate("tracked_enemy_tower_hp", enemy_tower, 1.0)
+        enemy_visible = enemy is not None and _is_visible_to(enemy, camp)
+        enemy_hp = self._tracked_hp_rate("tracked_enemy_hp", enemy if enemy_visible else None, 1.0)
+        tower_score = own_tower_hp - enemy_tower_hp
+        hp_score = my_hp - enemy_hp
         money_score = float(_get_any(hero, "money_cnt", "money", default=0) or 0)
         exp_score = float(_get_any(hero, "level", default=0) or 0) * 2000.0 + float(_get_any(hero, "exp", default=0) or 0)
         kill_cnt = float(_get_any(hero, "kill_cnt", default=0) or 0)
@@ -272,10 +322,24 @@ class GameRewardManager:
 
         enemy_count, friendly_count = len(enemy_soldiers), len(friendly_soldiers)
         total_soldier_count = enemy_count + friendly_count
-        if not self.has_seen_minions and total_soldier_count > 0:
+        lane_visible = total_soldier_count > 0
+        current_enemy_soldier_ids = set(_runtime_id(s) for s in enemy_soldiers)
+        current_friendly_soldier_ids = set(_runtime_id(s) for s in friendly_soldiers)
+        hit_prev_enemy_soldier = len(self.prev_enemy_soldier_ids & self._hit_target_ids(hero)) > 0
+        if not lane_visible:
+            enemy_soldier_reduced = 1.0 if self.has_seen_minions and self.prev_enemy_soldier_count > 0 and hit_prev_enemy_soldier else 0.0
+            lane_adv_delta = 0.0
+            self.has_seen_minions = False
+            self.prev_enemy_soldier_count = 0
+            self.prev_friendly_soldier_count = 0
+            self.prev_enemy_soldier_ids = set()
+            self.prev_friendly_soldier_ids = set()
+        elif not self.has_seen_minions:
             self.has_seen_minions = True
             self.prev_enemy_soldier_count = enemy_count
             self.prev_friendly_soldier_count = friendly_count
+            self.prev_enemy_soldier_ids = current_enemy_soldier_ids
+            self.prev_friendly_soldier_ids = current_friendly_soldier_ids
             enemy_soldier_reduced = 0.0
             lane_adv_delta = 0.0
         else:
@@ -283,15 +347,18 @@ class GameRewardManager:
             prev_adv = self.prev_friendly_soldier_count - self.prev_enemy_soldier_count
             cur_adv = friendly_count - enemy_count
             lane_adv_delta = float(cur_adv - prev_adv)
-        self.prev_enemy_soldier_count = enemy_count
-        self.prev_friendly_soldier_count = friendly_count
+            self.prev_enemy_soldier_count = enemy_count
+            self.prev_friendly_soldier_count = friendly_count
+            self.prev_enemy_soldier_ids = current_enemy_soldier_ids
+            self.prev_friendly_soldier_ids = current_friendly_soldier_ids
+        self.prev_lane_visible = lane_visible
 
         own_range = float(_get_any(own_tower, "attack_range", default=8800) or 8800)
         enemy_near_own = [s for s in enemy_soldiers if _dist(s, own_tower) <= own_range * 1.15]
-        near_own_reduced = max(0.0, float(self.prev_near_own_enemy_soldier_count - len(enemy_near_own)))
+        near_own_reduced = 0.0 if not lane_visible else max(0.0, float(self.prev_near_own_enemy_soldier_count - len(enemy_near_own)))
         self.prev_near_own_enemy_soldier_count = len(enemy_near_own)
-        enemy_ids = set(_runtime_id(s) for s in enemy_soldiers)
-        friendly_ids = set(_runtime_id(s) for s in friendly_soldiers)
+        enemy_ids = current_enemy_soldier_ids
+        friendly_ids = current_friendly_soldier_ids
         own_tower_target_enemy_soldier = _get_any(own_tower, "attack_target", default=0) in enemy_ids
         defense_emergency = own_tower_target_enemy_soldier or len(enemy_near_own) > 0
 
@@ -314,19 +381,34 @@ class GameRewardManager:
         if defense_emergency:
             if near_own_reduced > 0:
                 defense += near_own_reduced
-            own_tower_hp_delta = self._metric("own_tower_hp_for_defense", _hp_rate(own_tower), 1.0)
+            own_tower_hp_delta = self._metric("own_tower_hp_for_defense", own_tower_hp, 1.0)
             if own_tower_hp_delta < 0:
                 defense -= 1.0
             if _dist(hero, own_tower) > 15000 and enemy_soldier_reduced <= 0 and not self._hit_any(hero):
                 defense -= 0.2
         else:
-            self.prev["own_tower_hp_for_defense"] = _hp_rate(own_tower)
+            self.prev["own_tower_hp_for_defense"] = own_tower_hp
 
         lane_clear = enemy_soldier_reduced + lane_adv_delta * 0.3
         if defense_emergency and near_own_reduced > 0:
             lane_clear += 0.5 * near_own_reduced
+        lane_clear = max(-1.0, min(3.0, lane_clear))
 
-        no_ops = 1.0 if _alive(hero) and (not self._has_real_cmd(hero)) and (not self._hit_any(hero)) else 0.0
+        no_ops = 0.0
+        if _alive(hero) and (not self._has_real_cmd(hero)) and (not self._hit_any(hero)):
+            no_ops = min(1.0, self.no_effective_action_steps / 10.0)
+        dist_enemy_tower = self._tracked_dist("tracked_enemy_tower_dist", hero, enemy_tower, DIST_NORM)
+        dist_own_tower = self._tracked_dist("tracked_own_tower_dist", hero, own_tower, DIST_NORM)
+        prev_enemy_tower_dist = self.prev.get("enemy_tower_dist", dist_enemy_tower)
+        prev_own_tower_dist = self.prev.get("own_tower_dist", dist_own_tower)
+        self.prev["enemy_tower_dist"] = dist_enemy_tower
+        self.prev["own_tower_dist"] = dist_own_tower
+        forward = (prev_enemy_tower_dist - dist_enemy_tower) / 10000.0
+        leave_home = (dist_own_tower - prev_own_tower_dist) / 10000.0
+        forward += 0.3 * leave_home
+        if frame_no > 300 and (not defense_emergency) and my_hp > 0.55 and dist_own_tower < 14000:
+            forward -= 0.20
+        forward = max(-1.0, min(1.0, forward))
 
         reward = {
             "tower_hp_point": self._metric("tower_score", tower_score, 1.0),
@@ -340,6 +422,7 @@ class GameRewardManager:
             "tower_risk": tower_risk,
             "stuck": stuck,
             "no_ops": no_ops,
+            "forward": forward,
             "grass_behavior": grass_behavior,
             "skill_hit": self._calc_skill_hit(hero),
             "hero_hurt": max(0.0, self._metric("hero_hurt", hero_hurt, 20000.0)),
@@ -350,8 +433,6 @@ class GameRewardManager:
             "bad_skill": 0.0,
             "passive_skills": 0.0,
             "crit": 0.0,
-            "in_grass": 0.0,
-            "forward": 0.0,
             "ep_rate": 0.0,
             "monster_resource": 0.0,
         }

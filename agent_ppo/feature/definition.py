@@ -34,6 +34,13 @@ def lineup_iterator_roundrobin_camp_heroes(camp_heroes=None):
     return _lineup_iterator_shuffle_cycle(camps)
 
 
+def lineup_iterator_from_pairs(lineup_pairs=None):
+    if not lineup_pairs:
+        raise Exception("lineup_pairs is empty")
+    camps = [list(pair) for pair in lineup_pairs]
+    return _lineup_iterator_shuffle_cycle(camps)
+
+
 ObsData = create_cls("ObsData", feature=None, legal_action=None, lstm_cell=None, lstm_hidden=None)
 
 ActData = create_cls(

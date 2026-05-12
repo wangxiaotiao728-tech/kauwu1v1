@@ -17,6 +17,13 @@ D401 replica monitor builder.
 from kaiwudrl.common.monitor.monitor_config_builder import MonitorConfigBuilder
 
 
+DYNAMIC_GAUGE_METRICS = {
+    "learning_rate",
+    "entropy_beta",
+    "ppo_clip",
+}
+
+
 def _precision(metric):
     if metric == "learning_rate":
         return "0.00000001"
@@ -43,9 +50,10 @@ def _precision(metric):
 
 
 def _add_metric(builder, metric):
+    agg = "max" if metric in DYNAMIC_GAUGE_METRICS else "avg"
     return builder.add_metric(
         metrics_name=metric,
-        expr=f"round(avg({metric}{{}}), {_precision(metric)})",
+        expr=f"round({agg}({metric}{{}}), {_precision(metric)})",
     )
 
 
@@ -276,6 +284,9 @@ def build_monitor():
     # 新增环境指标：只追加
     # ============================================================
     new_env_panels = [
+        ("胜负", "win", [
+            "win",
+        ]),
         ("塔血对比", "tower_compare", [
             "own_tower_hp_ratio",
             "enemy_tower_hp_ratio",
@@ -299,7 +310,6 @@ def build_monitor():
         ("对局信息", "episode_info", [
             "episode_cnt",
             "frame_no",
-            "opponent_type",
         ]),
     ]
 
@@ -307,7 +317,33 @@ def build_monitor():
         group_name="新增环境",
         group_name_en="new_env",
     )
-    builder = _add_multi_metric_panels(builder, new_env_panels).end_group()
+    builder = _add_multi_metric_panels(builder, new_env_panels)
+    builder = (
+        builder
+        .add_panel(
+            name="MatchupèƒœçŽ‡",
+            name_en="matchup_win_rate",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="112_vs_112",
+            expr="round(avg(matchup_112_vs_112_win_rate{}), 0.0001)",
+        )
+        .add_metric(
+            metrics_name="112_vs_133",
+            expr="round(avg(matchup_112_vs_133_win_rate{}), 0.0001)",
+        )
+        .add_metric(
+            metrics_name="133_vs_112",
+            expr="round(avg(matchup_133_vs_112_win_rate{}), 0.0001)",
+        )
+        .add_metric(
+            metrics_name="133_vs_133",
+            expr="round(avg(matchup_133_vs_133_win_rate{}), 0.0001)",
+        )
+        .end_panel()
+        .end_group()
+    )
 
     # ============================================================
     # 新增三组奖励：只追加
@@ -338,6 +374,7 @@ def build_monitor():
             "lane_clear",
             "defense",
             "cake",
+            "forward",
         ]),
         ("风险行为", "risk_behavior", [
             "tower_risk",
