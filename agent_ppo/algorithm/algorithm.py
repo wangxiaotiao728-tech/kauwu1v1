@@ -58,7 +58,7 @@ class Algorithm:
             total_loss, info_list = self.model.compute_loss(data_list, rst_list)
             total_loss.backward()
             if Config.USE_GRAD_CLIP:
-                torch.nn.utils.clip_grad_norm_(self.parameters, Config.GRAD_CLIP_RANGE)
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters, Config.GRAD_CLIP_RANGE)
             self.optimizer.step()
             last_total_loss = total_loss
             last_info_list = info_list
@@ -102,7 +102,8 @@ class Algorithm:
                     "entropy_loss": round(entropy_loss, 4),
                     "approx_kl": round(approx_kl, 6),
                     "clip_fraction": round(clip_fraction, 4),
-                    "lr": round(lr, 8),
+                    "learning_rate": round(lr, 8),
+                    "grad_norm": round(float(grad_norm), 4) if "grad_norm" in locals() else 0.0,
                     "entropy_beta": round(float(getattr(self.model, "var_beta", 0.0)), 6),
                     "ppo_clip": round(float(getattr(self.model, "clip_param", 0.0)), 4),
                 }

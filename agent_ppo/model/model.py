@@ -3,15 +3,10 @@
 ###########################################################################
 # Copyright © 1998 - 2026 Tencent. All Rights Reserved.
 ###########################################################################
-"""
-D401 replica model.
+"""Final D401-256 grouped LSTM model.
 
-Compared with the baseline model, this version:
-1. Actually uses LSTM for train/inference.
-2. Splits the baseline feature into hero/tower groups and encodes them before fusion.
-3. Keeps 6 official action heads.
-4. Uses a naive target-attention head for the target branch.
-5. Adds value clipping and optional dual-clip PPO in compute_loss.
+Uses 256 protocol features, 7 grouped encoders, fusion MLP, LSTM384,
+6 official action heads, target context, and 3 value-group heads.
 """
 
 import math
@@ -50,21 +45,23 @@ class Model(nn.Module):
         self.legal_action_dim = int(np.sum(Config.LEGAL_ACTION_SIZE_LIST))
         self.lstm_hidden_dim = Config.LSTM_UNIT_SIZE
 
-        # Expanded grouped feature encoders.
-        # Layout must match agent_ppo.feature.feature_process.FeatureProcess.
-        # self(16), enemy(24), skills(20), lane(28), tower(16), target(16), history(8).
+        # Feature layout: self(32), enemy(32), skill(56), lane(40),
+        # objective(32), target(40), history(24).
         self.feature_group_sizes = list(getattr(Config, "FEATURE_GROUP_SIZES", [self.feature_dim]))
         if sum(self.feature_group_sizes) != self.feature_dim:
-            # Fallback to one group if the config is inconsistent.
             self.feature_group_sizes = [self.feature_dim]
 
+        default_out_dims = [64, 64, 128, 96, 64, 96, 64]
+        if len(default_out_dims) != len(self.feature_group_sizes):
+            default_out_dims = [64] * len(self.feature_group_sizes)
+        self.group_out_dims = default_out_dims
         self.group_encoders = nn.ModuleList(
             [
-                MLP([max(1, group_dim), 64, 64], f"feature_group_{idx}_encoder", non_linearity_last=True)
-                for idx, group_dim in enumerate(self.feature_group_sizes)
+                MLP([max(1, group_dim), out_dim, out_dim], f"feature_group_{idx}_encoder", non_linearity_last=True)
+                for idx, (group_dim, out_dim) in enumerate(zip(self.feature_group_sizes, self.group_out_dims))
             ]
         )
-        self.fusion_mlp = MLP([64 * len(self.feature_group_sizes), 512, self.lstm_unit_size], "fusion_mlp", non_linearity_last=True)
+        self.fusion_mlp = MLP([sum(self.group_out_dims), Config.FUSION_DIM, self.lstm_unit_size], "fusion_mlp", non_linearity_last=True)
 
         self.lstm = nn.LSTM(
             input_size=self.lstm_unit_size,

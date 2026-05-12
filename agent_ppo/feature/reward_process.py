@@ -1,36 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
-###########################################################################
-# Copyright © 1998 - 2026 Tencent. All Rights Reserved.
-###########################################################################
-"""D401 replica reward process.
+"""Final reward process for D401-256.
 
-This file intentionally follows the reward ideas in the provided D401 report:
-hero_hurt, total_damage, hero_damage, crit, skill_hit, no_ops, in_grass,
-under_tower_behavior, passive_skills, plus the original tower/forward baseline.
-All field access is defensive because different environment versions expose
-slightly different naming styles.
+Returns per-item raw rewards, weighted 3-group rewards, and reward_sum.
+The policy/value pipeline consumes reward_groups in feature.definition.
 """
 
 import math
+from typing import Any, Dict, List, Optional
+
 from agent_ppo.conf.conf import GameConfig
 
-
-class RewardStruct:
-    def __init__(self, m_weight=0.0):
-        self.cur_frame_value = 0.0
-        self.last_frame_value = 0.0
-        self.value = 0.0
-        self.weight = m_weight
-        self.min_value = -1
-        self.is_first_arrive_center = True
+DIST_NORM = 60000.0
 
 
-def init_calc_frame_map():
-    return {key: RewardStruct(weight) for key, weight in GameConfig.REWARD_WEIGHT_DICT.items()}
-
-
-def _get(obj, key, default=0):
+def _get(obj, key, default=None):
     if obj is None:
         return default
     if isinstance(obj, dict):
@@ -38,444 +22,362 @@ def _get(obj, key, default=0):
     return getattr(obj, key, default)
 
 
-def _get_any(obj, *keys, default=0):
+def _get_any(obj, *keys, default=None):
     for key in keys:
         val = _get(obj, key, None)
         if val is not None:
             return val
-    actor_state = _get(obj, "actor_state", None)
-    if actor_state is not None:
-        for key in keys:
-            val = _get(actor_state, key, None)
-            if val is not None:
-                return val
-        values = _get(actor_state, "values", None)
-        if values is not None:
-            for key in keys:
-                val = _get(values, key, None)
-                if val is not None:
-                    return val
     return default
 
 
+def _to_int(v, default=-1):
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
 def _loc(actor):
-    return _get_any(actor, "location", default={"x": 0, "z": 0}) or {"x": 0, "z": 0}
+    loc = _get_any(actor, "location", default={}) or {}
+    if isinstance(loc, dict):
+        return {"x": float(loc.get("x", 0) or 0), "z": float(loc.get("z", 0) or 0)}
+    return {"x": 0.0, "z": 0.0}
 
 
 def _dist(a, b):
+    if a is None or b is None:
+        return DIST_NORM
     la, lb = _loc(a), _loc(b)
-    dx = float(_get(la, "x", 0)) - float(_get(lb, "x", 0))
-    dz = float(_get(la, "z", 0)) - float(_get(lb, "z", 0))
+    dx, dz = la["x"] - lb["x"], la["z"] - lb["z"]
     return math.sqrt(dx * dx + dz * dz)
 
 
 def _hp_rate(actor):
-    hp = float(_get_any(actor, "hp", default=0))
-    max_hp = max(1.0, float(_get_any(actor, "max_hp", default=1)))
-    return hp / max_hp
+    hp = float(_get_any(actor, "hp", default=0) or 0)
+    max_hp = max(1.0, float(_get_any(actor, "max_hp", "maxHp", default=1) or 1))
+    return max(0.0, min(1.0, hp / max_hp))
 
 
-def _is_alive(actor):
-    return _get_any(actor, "hp", default=0) > 0
+def _alive(actor):
+    return float(_get_any(actor, "hp", default=0) or 0) > 0
 
 
-def _enum_str(value):
-    return str(value).upper() if value is not None else ""
-
-
-def _enum_matches(value, names, nums):
-    s = _enum_str(value)
-    if s in names:
-        return True
-    try:
-        return int(value) in nums
-    except Exception:
-        return False
+def _runtime_id(actor):
+    return _get_any(actor, "runtime_id", "runtimeId", default=None)
 
 
 def _config_id(actor):
     return _get_any(actor, "config_id", "configId", default=None)
 
 
-def _actor_type(actor):
-    return _get_any(actor, "actor_type", "actorType", default=None)
-
-
 def _sub_type(actor):
     return _get_any(actor, "sub_type", "subType", default=None)
 
 
-def _is_tower(npc):
-    # Official strict ordinary tower check: ACTOR_SUB_TOWER only.
-    # Numeric fallback is configured in GameConfig.TOWER_SUB_TYPES.
-    return _enum_matches(_sub_type(npc), {"ACTOR_SUB_TOWER"}, set(getattr(GameConfig, "TOWER_SUB_TYPES", {21})))
+def _camp(actor):
+    return _get_any(actor, "camp", default=None)
 
 
 def _is_soldier(npc):
-    # Official strict soldier check: ACTOR_SUB_SOLDIER only.
-    # Unknown NPCs/monsters must not be counted as soldiers.
-    if npc is None or not _is_alive(npc):
-        return False
-    if _enum_matches(_sub_type(npc), {"ACTOR_SUB_SOLDIER"}, set(getattr(GameConfig, "SOLDIER_SUB_TYPES", set()))):
-        return True
-    try:
-        return int(_config_id(npc)) in set(getattr(GameConfig, "SOLDIER_CONFIG_IDS", set()))
-    except Exception:
-        return False
+    return npc is not None and _alive(npc) and (
+        _to_int(_sub_type(npc)) in GameConfig.SOLDIER_SUB_TYPES
+        or _to_int(_config_id(npc)) in GameConfig.SOLDIER_CONFIG_IDS
+    )
+
+
+def _is_tower(npc):
+    return npc is not None and _alive(npc) and (
+        _to_int(_sub_type(npc)) in GameConfig.TOWER_SUB_TYPES
+        or _to_int(_config_id(npc)) in GameConfig.TOWER_CONFIG_IDS
+    )
 
 
 def _is_monster(npc):
-    if npc is None or not _is_alive(npc):
-        return False
-    if _enum_matches(_actor_type(npc), {"ACTOR_TYPE_MONSTER"}, set(getattr(GameConfig, "MONSTER_ACTOR_TYPES", set()))):
-        return True
-    try:
-        return int(_config_id(npc)) in set(getattr(GameConfig, "MONSTER_CONFIG_IDS", set()))
-    except Exception:
-        return False
+    return npc is not None and _alive(npc) and _to_int(_config_id(npc)) in GameConfig.MONSTER_CONFIG_IDS
+
+
+def _slot_states(hero):
+    state = _get_any(hero, "skill_state", default={}) or {}
+    return _get(state, "slot_states", []) or []
 
 
 class GameRewardManager:
     def __init__(self, main_hero_runtime_id):
         self.main_hero_player_id = main_hero_runtime_id
         self.main_hero_camp = -1
-        self.m_reward_value = {}
-        self.m_last_frame_no = -1
-        self.m_cur_calc_frame_map = init_calc_frame_map()
-        self.m_main_calc_frame_map = init_calc_frame_map()
-        self.m_enemy_calc_frame_map = init_calc_frame_map()
+        self.prev = {}
+        self.has_seen_minions = False
+        self.prev_enemy_soldier_count = 0
+        self.prev_friendly_soldier_count = 0
+        self.prev_near_own_enemy_soldier_count = 0
+        self.last_self_pos = None
+        self.no_effective_action_steps = 0
+        self.grass_steps = 0
+        self.grass_no_effective_steps = 0
         self.time_scale_arg = GameConfig.TIME_SCALE_ARG
-        self.m_each_level_max_exp = {}
 
-    def init_max_exp_of_each_hero(self):
-        self.m_each_level_max_exp.clear()
-        for k, v in {
-            1: 160,
-            2: 298,
-            3: 446,
-            4: 524,
-            5: 613,
-            6: 713,
-            7: 825,
-            8: 950,
-            9: 1088,
-            10: 1240,
-            11: 1406,
-            12: 1585,
-            13: 1778,
-            14: 1984,
-        }.items():
-            self.m_each_level_max_exp[k] = v
-
-    def _compose_weighted_reward_groups(self):
-        """Return weighted group rewards and scalar sum from current m_reward_value.
-
-        Each reward item value is already a delta/potential value. It is
-        multiplied by its configured scale and accumulated into its D401 reward
-        group. These group rewards are later used to compute separate GAE
-        returns for the multi-critic heads.
-        """
-        reward_groups = {name: 0.0 for name in GameConfig.REWARD_GROUPS.keys()}
-        assigned = set()
-        for group_name, keys in GameConfig.REWARD_GROUPS.items():
-            group_sum = 0.0
-            for key in keys:
-                assigned.add(key)
-                if key not in self.m_cur_calc_frame_map:
-                    continue
-                weight = self.m_cur_calc_frame_map[key].weight
-                group_sum += self.m_reward_value.get(key, 0.0) * weight
-            reward_groups[group_name] = group_sum
-
-        # Any ungrouped reward is kept in decay group by default, so no reward
-        # silently disappears if users later add an item to REWARD_WEIGHT_DICT.
-        default_group = next(iter(reward_groups.keys()), None)
-        if default_group is not None:
-            for key, reward_struct in self.m_cur_calc_frame_map.items():
-                if key in assigned:
-                    continue
-                reward_groups[default_group] += self.m_reward_value.get(key, 0.0) * reward_struct.weight
-
-        reward_sum = sum(reward_groups.values())
-        return reward_groups, reward_sum
-
-    def result(self, frame_data):
-        self.init_max_exp_of_each_hero()
-        self.frame_data_process(frame_data)
-        self.get_reward(frame_data, self.m_reward_value)
-        frame_no = frame_data.get("frame_no", 0)
-        if self.time_scale_arg > 0:
-            decay_factor = math.pow(0.6, 1.0 * frame_no / self.time_scale_arg)
-            for key in list(self.m_reward_value.keys()):
-                if key in ("reward_sum", "reward_groups") or key in GameConfig.NO_DECAY_REWARD_KEYS:
-                    continue
-                self.m_reward_value[key] *= decay_factor
-
-        reward_groups, reward_sum = self._compose_weighted_reward_groups()
-        self.m_reward_value["reward_groups"] = reward_groups
-        self.m_reward_value["reward_sum"] = reward_sum
-        return self.m_reward_value
-
-    def _find_main_and_enemy(self, frame_data, camp):
-        main_hero, enemy_hero = None, None
+    def _find_heroes(self, frame_data):
+        main, enemy = None, None
         for hero in frame_data.get("hero_states", []):
-            if _get_any(hero, "camp", default=None) == camp:
-                main_hero = hero
+            rid = _runtime_id(hero)
+            pid = _get_any(hero, "player_id", default=None)
+            if rid == self.main_hero_player_id or pid == self.main_hero_player_id:
+                main = hero
+                self.main_hero_camp = _camp(hero)
             else:
-                enemy_hero = hero
-        return main_hero, enemy_hero
+                enemy = hero
+        # Fallback by cached camp.
+        if main is None and self.main_hero_camp != -1:
+            for hero in frame_data.get("hero_states", []):
+                if _camp(hero) == self.main_hero_camp:
+                    main = hero
+                else:
+                    enemy = hero
+        return main, enemy
 
-    def _find_towers(self, frame_data, camp):
-        main_tower, enemy_tower = None, None
+    def _split_npcs(self, frame_data, camp):
+        soldiers, friendly_soldiers, enemy_soldiers, towers, monsters = [], [], [], [], []
         for npc in frame_data.get("npc_states", []):
-            if not _is_tower(npc):
-                continue
-            if _get_any(npc, "camp", default=None) == camp:
-                main_tower = npc
+            if _is_soldier(npc):
+                soldiers.append(npc)
+                if _camp(npc) == camp:
+                    friendly_soldiers.append(npc)
+                else:
+                    enemy_soldiers.append(npc)
+            elif _is_tower(npc):
+                towers.append(npc)
+            elif _is_monster(npc):
+                monsters.append(npc)
+        own_tower, enemy_tower = None, None
+        for t in towers:
+            if _camp(t) == camp:
+                own_tower = t
             else:
-                enemy_tower = npc
-        return main_tower, enemy_tower
+                enemy_tower = t
+        return friendly_soldiers, enemy_soldiers, own_tower, enemy_tower, monsters
 
-    def _friendly_soldier_near_tower(self, frame_data, camp, tower):
-        if tower is None:
-            return False
-        tower_range = float(_get_any(tower, "attack_range", default=0) or 0)
-        for npc in frame_data.get("npc_states", []):
-            if _get_any(npc, "camp", default=None) != camp:
+    def _split_cakes(self, frame_data, own_tower, enemy_tower):
+        cakes = []
+        for cake in frame_data.get("cakes", []) or []:
+            if _to_int(_get_any(cake, "configId", "config_id", default=-1)) not in GameConfig.CAKE_CONFIG_IDS:
                 continue
-            if not _is_soldier(npc):
+            collider = _get(cake, "collider", {}) or {}
+            loc = _get(collider, "location", {}) or {}
+            if not isinstance(loc, dict):
                 continue
-            if _hp_rate(npc) <= 0:
-                continue
-            if tower_range > 0 and _dist(npc, tower) <= tower_range * 1.10:
-                return True
-        return False
+            cakes.append((cake, {"x": float(loc.get("x", 0) or 0), "z": float(loc.get("z", 0) or 0)}))
+        if not cakes:
+            return None, None
+        own_pos = _loc(own_tower) if own_tower is not None else {"x": -15000.0, "z": -15000.0}
+        enemy_pos = _loc(enemy_tower) if enemy_tower is not None else {"x": 15000.0, "z": 15000.0}
+        own = min(cakes, key=lambda item: math.hypot(item[1]["x"] - own_pos["x"], item[1]["z"] - own_pos["z"]))
+        remain = [c for c in cakes if c is not own]
+        enemy = min(remain, key=lambda item: math.hypot(item[1]["x"] - enemy_pos["x"], item[1]["z"] - enemy_pos["z"])) if remain else None
+        return own, enemy
 
+    def _metric(self, key, cur, scale=1.0):
+        last = self.prev.get(key, cur)
+        self.prev[key] = cur
+        return (cur - last) / max(1e-6, scale)
 
-    def _enemy_soldier_count(self, frame_data, camp):
-        """Count alive enemy soldiers from the perspective of camp.
+    def _has_real_cmd(self, hero):
+        return len(_get_any(hero, "real_cmd", default=[]) or []) > 0
 
-        This is intentionally coarse and result-style: reducing enemy soldier
-        count while keeping friendly soldiers creates positive lane advantage.
-        It does not reward every point of minion HP damage.
-        """
-        cnt = 0
-        for npc in frame_data.get("npc_states", []):
-            if _get_any(npc, "camp", default=None) == camp:
-                continue
-            if _is_tower(npc):
-                continue
-            if not _is_alive(npc):
-                continue
-            if not _is_soldier(npc):
-                continue
-            cnt += 1
-        return cnt
+    def _hit_any(self, hero):
+        return len(_get_any(hero, "hit_target_info", default=[]) or []) > 0
 
-    def _calc_bad_skill(self, hero):
-        """Small miss proxy: usedTimes - hitHeroTimes.
+    def _update_stuck_grass(self, hero, defense_emergency, enemy_soldier_reduced):
+        pos = _loc(hero)
+        if self.last_self_pos is None:
+            moved = DIST_NORM
+        else:
+            moved = math.hypot(pos["x"] - self.last_self_pos[0], pos["z"] - self.last_self_pos[1])
+        self.last_self_pos = (pos["x"], pos["z"])
+        has_cmd = self._has_real_cmd(hero)
+        hit_any = self._hit_any(hero)
+        if _alive(hero) and moved < 100 and (not has_cmd) and (not hit_any):
+            self.no_effective_action_steps += 1
+        else:
+            self.no_effective_action_steps = 0
+        stuck = 1.0 if self.no_effective_action_steps >= 8 else 0.0
 
-        D401 already rewards skill_hit. This extra metric gives a weak negative
-        signal when skill usage increases but hero hit count does not. Keep the
-        configured weight small because some skills are valid for clearing lane.
-        """
-        skill_state = _get_any(hero, "skill_state", default={})
-        slot_states = _get(skill_state, "slot_states", []) or []
-        used_total = 0.0
-        hit_total = 0.0
-        for slot in slot_states:
-            used_total += float(_get_any(slot, "usedTimes", "used_times", default=0) or 0)
-            hit_total += float(_get_any(slot, "hitHeroTimes", "hit_hero_times", default=0) or 0)
-        return max(0.0, used_total - hit_total) / 100.0
+        in_grass = bool(_get_any(hero, "is_in_grass", default=False))
+        grass_behavior = 0.0
+        if in_grass:
+            self.grass_steps += 1
+            if not has_cmd and not hit_any and enemy_soldier_reduced <= 0:
+                self.grass_no_effective_steps += 1
+            else:
+                self.grass_no_effective_steps = 0
+            if hit_any:
+                grass_behavior += 0.3
+            if enemy_soldier_reduced > 0:
+                grass_behavior += 0.2
+            if defense_emergency and self.grass_steps >= 6 and enemy_soldier_reduced <= 0:
+                grass_behavior -= 1.0
+            if self.grass_no_effective_steps >= 8:
+                grass_behavior -= 1.0
+        else:
+            self.grass_steps = 0
+            self.grass_no_effective_steps = 0
+        return stuck, grass_behavior
 
     def _calc_skill_hit(self, hero):
-        skill_state = _get_any(hero, "skill_state", default={})
-        slot_states = _get(skill_state, "slot_states", []) or []
-        vals = []
-        for slot in slot_states:
-            used = float(_get_any(slot, "usedTimes", "used_times", default=0) or 0)
-            if used <= 0:
-                continue
-            hit = float(_get_any(slot, "hitHeroTimes", "hit_hero_times", default=0) or 0)
-            vals.append(hit / max(1.0, used))
-        return sum(vals) / max(1, len(slot_states)) if slot_states else 0.0
+        # Reward effective hits on any target; do not punish non-hero skill usage.
+        return 1.0 if self._hit_any(hero) else 0.0
 
-    def _calc_in_grass(self, hero, enemy_hero):
-        if not bool(_get_any(hero, "is_in_grass", default=False)):
-            return 0.0
-        val = 0.25
-        main_visible = _get_any(hero, "camp_visible", default=[])
-        enemy_visible = _get_any(enemy_hero, "camp_visible", default=[])
-        try:
-            main_vis_all = all(main_visible)
-            enemy_vis_all = all(enemy_visible)
-            if (not main_vis_all) and enemy_vis_all:
-                val += 0.5
-        except Exception:
-            pass
-        if enemy_hero is not None:
-            attack_range = float(_get_any(hero, "attack_range", default=0) or 0)
-            if attack_range > 0 and _dist(hero, enemy_hero) <= attack_range:
-                val += 0.5
-        return val
-
-    def _calc_under_tower_behavior(self, frame_data, hero, enemy_hero, enemy_tower, camp):
-        if hero is None or enemy_tower is None:
-            return 0.0
-        tower_range = float(_get_any(enemy_tower, "attack_range", default=0) or 0)
-        in_tower_range = _dist(hero, enemy_tower) <= tower_range
-        if not in_tower_range:
-            return 0.0
-        has_ally_soldier = self._friendly_soldier_near_tower(frame_data, camp, enemy_tower)
-        reward = 0.0
-        if not has_ally_soldier:
-            reward -= 0.5
-        attack_target = _get_any(hero, "attack_target", default=-1)
-        if has_ally_soldier:
-            if attack_target == _get_any(enemy_tower, "runtime_id", default=None):
-                reward += 1.0
-            elif enemy_hero is not None and attack_target == _get_any(enemy_hero, "runtime_id", default=None):
-                reward -= 0.3
-            else:
-                for npc in frame_data.get("npc_states", []):
-                    if _get_any(npc, "camp", default=None) == camp:
-                        continue
-                    if not _is_soldier(npc):
-                        continue
-                    if attack_target == _get_any(npc, "runtime_id", default=None):
-                        reward += 0.2
-                        break
-        return reward
-
-    def _calc_passive_skills(self, hero):
-        """Official protocol exposes PassiveSkill(passive_skillid, cooldown).
-
-        It does not expose D401-style level/triggered fields, so this reward is
-        intentionally conservative. The default weight in conf.py is 0.0; this
-        value is kept only for monitoring / future ablation.
-        """
-        passive_skills = _get_any(hero, "passive_skill", default=[]) or []
-        if not passive_skills:
-            return 0.0
-        ready_cnt = 0
-        for skill in passive_skills:
-            cooldown = float(_get(skill, "cooldown", 0) or 0)
-            if cooldown <= 0:
-                ready_cnt += 1
-        return ready_cnt / max(1.0, float(len(passive_skills)))
-
-    def set_cur_calc_frame_vec(self, calc_frame_map, frame_data, camp):
-        main_hero, enemy_hero = self._find_main_and_enemy(frame_data, camp)
-        main_tower, enemy_tower = self._find_towers(frame_data, camp)
-        for reward_name, reward_struct in calc_frame_map.items():
-            reward_struct.last_frame_value = reward_struct.cur_frame_value
-            if main_hero is None:
-                reward_struct.cur_frame_value = 0.0
-                continue
-            if reward_name == "tower_hp_point":
-                reward_struct.cur_frame_value = _hp_rate(main_tower)
-            elif reward_name == "hp_point":
-                reward_struct.cur_frame_value = _hp_rate(main_hero)
-            elif reward_name == "money":
-                reward_struct.cur_frame_value = float(_get_any(main_hero, "money_cnt", "money", default=0)) / 30000.0
-            elif reward_name == "exp":
-                level = int(_get_any(main_hero, "level", default=1) or 1)
-                max_exp = max(1, self.m_each_level_max_exp.get(level, 2000))
-                reward_struct.cur_frame_value = level / 15.0 + float(_get_any(main_hero, "exp", default=0)) / max_exp / 15.0
-            elif reward_name == "kill":
-                reward_struct.cur_frame_value = float(_get_any(main_hero, "kill_cnt", default=0))
-            elif reward_name == "death":
-                reward_struct.cur_frame_value = float(_get_any(main_hero, "dead_cnt", default=0))
-            elif reward_name == "ep_rate":
-                ep = float(_get_any(main_hero, "ep", default=0))
-                max_ep = max(1.0, float(_get_any(main_hero, "max_ep", default=1)))
-                reward_struct.cur_frame_value = ep / max_ep
-            elif reward_name == "last_hit":
-                # Baseline protocol does not expose an explicit last-hit event here.
-                # Use money_cnt as a weak monotonically increasing proxy.
-                reward_struct.cur_frame_value = float(_get_any(main_hero, "money_cnt", "money", default=0)) / 30000.0
-            elif reward_name == "forward":
-                reward_struct.cur_frame_value = self.calculate_forward(main_hero, main_tower, enemy_tower)
-            elif reward_name == "lane_clear":
-                # Potential is negative enemy soldier count. Through the standard
-                # zero-sum delta, this rewards reducing enemy soldiers and keeping
-                # friendly lane presence.
-                reward_struct.cur_frame_value = -float(self._enemy_soldier_count(frame_data, camp)) / 10.0
-            elif reward_name == "hero_hurt":
-                reward_struct.cur_frame_value = float(
-                    _get_any(main_hero, "total_be_hurt_by_hero", "totalBeHurtByHero", default=0)
-                ) / 2e4
-            elif reward_name == "hero_damage":
-                reward_struct.cur_frame_value = float(
-                    _get_any(main_hero, "total_hurt_to_hero", "totalHurtToHero", default=0)
-                ) / 2e4
-            elif reward_name == "total_damage":
-                reward_struct.cur_frame_value = float(_get_any(main_hero, "total_hurt", "totalHurt", default=0)) / 6e4
-            elif reward_name == "crit":
-                crit_rate = float(_get_any(main_hero, "crit_rate", default=0))
-                crit_effe = float(_get_any(main_hero, "crit_effe", default=0))
-                reward_struct.cur_frame_value = crit_rate * crit_effe / 1e4
-            elif reward_name == "skill_hit":
-                reward_struct.cur_frame_value = self._calc_skill_hit(main_hero)
-            elif reward_name == "bad_skill":
-                reward_struct.cur_frame_value = self._calc_bad_skill(main_hero)
-            elif reward_name == "no_ops":
-                behav = _get_any(main_hero, "behav_mode", default="")
-                reward_struct.cur_frame_value = 1.0 if str(behav) == "State_Idle" or behav == 0 else 0.0
-            elif reward_name == "in_grass":
-                reward_struct.cur_frame_value = self._calc_in_grass(main_hero, enemy_hero)
-            elif reward_name == "under_tower_behavior":
-                reward_struct.cur_frame_value = self._calc_under_tower_behavior(
-                    frame_data, main_hero, enemy_hero, enemy_tower, camp
-                )
-            elif reward_name == "passive_skills":
-                reward_struct.cur_frame_value = self._calc_passive_skills(main_hero)
-
-    def calculate_forward(self, main_hero, main_tower, enemy_tower):
-        if main_hero is None or main_tower is None or enemy_tower is None:
-            return 0.0
-        dist_hero2emy = _dist(main_hero, enemy_tower)
-        dist_main2emy = max(1.0, _dist(main_tower, enemy_tower))
-        if _hp_rate(main_hero) > 0.99 and dist_hero2emy > dist_main2emy:
-            return (dist_main2emy - dist_hero2emy) / dist_main2emy
+    def _calc_cake(self, hero, own_cake):
+        cur_hp = _hp_rate(hero)
+        own_cake_exists = own_cake is not None
+        if own_cake is not None:
+            loc = own_cake[1]
+            pos = _loc(hero)
+            dist = math.hypot(loc["x"] - pos["x"], loc["z"] - pos["z"])
+        else:
+            dist = DIST_NORM
+        prev_hp = self.prev.get("my_hp_ratio_for_cake", cur_hp)
+        prev_dist = self.prev.get("own_cake_dist", dist)
+        prev_exists = self.prev.get("own_cake_exists", 0.0) > 0.5
+        self.prev["my_hp_ratio_for_cake"] = cur_hp
+        self.prev["own_cake_dist"] = dist
+        self.prev["own_cake_exists"] = 1.0 if own_cake_exists else 0.0
+        picked = prev_exists and prev_dist < 2000 and cur_hp > prev_hp + 0.03
+        if picked and prev_hp < GameConfig.CAKE_LOW_HP_THRESHOLD:
+            return 1.0
+        if picked and prev_hp < GameConfig.CAKE_MEDIUM_HP_THRESHOLD:
+            return 0.3
+        if cur_hp < GameConfig.CAKE_LOW_HP_THRESHOLD and own_cake_exists:
+            return max(0.0, (prev_dist - dist) / 10000.0) * 0.2
         return 0.0
 
-    def frame_data_process(self, frame_data):
-        main_camp, enemy_camp = -1, -1
-        for hero in frame_data.get("hero_states", []):
-            runtime_id = _get_any(hero, "runtime_id", default=None)
-            player_id = _get_any(hero, "player_id", default=None)
-            if runtime_id == self.main_hero_player_id or player_id == self.main_hero_player_id:
-                main_camp = _get_any(hero, "camp", default=-1)
-                self.main_hero_camp = main_camp
-            else:
-                enemy_camp = _get_any(hero, "camp", default=-1)
-        if main_camp == -1 and frame_data.get("hero_states"):
-            main_camp = _get_any(frame_data["hero_states"][0], "camp", default=-1)
-        if enemy_camp == -1:
-            for hero in frame_data.get("hero_states", []):
-                if _get_any(hero, "camp", default=-1) != main_camp:
-                    enemy_camp = _get_any(hero, "camp", default=-1)
-                    break
-        self.set_cur_calc_frame_vec(self.m_main_calc_frame_map, frame_data, main_camp)
-        self.set_cur_calc_frame_vec(self.m_enemy_calc_frame_map, frame_data, enemy_camp)
+    def result(self, frame_data):
+        frame_no = int(frame_data.get("frame_no", 0) or 0)
+        hero, enemy = self._find_heroes(frame_data)
+        if hero is None:
+            return {"reward_sum": 0.0, "reward_groups": {name: 0.0 for name in GameConfig.REWARD_GROUP_NAMES}}
+        camp = _camp(hero)
+        friendly_soldiers, enemy_soldiers, own_tower, enemy_tower, monsters = self._split_npcs(frame_data, camp)
+        own_cake, enemy_cake = self._split_cakes(frame_data, own_tower, enemy_tower)
 
-    def get_reward(self, frame_data, reward_dict):
-        reward_dict.clear()
-        for reward_name, reward_struct in self.m_cur_calc_frame_map.items():
-            if reward_name == "forward":
-                reward_struct.value = self.m_main_calc_frame_map[reward_name].cur_frame_value
-            else:
-                reward_struct.cur_frame_value = (
-                    self.m_main_calc_frame_map[reward_name].cur_frame_value
-                    - self.m_enemy_calc_frame_map[reward_name].cur_frame_value
-                )
-                reward_struct.last_frame_value = (
-                    self.m_main_calc_frame_map[reward_name].last_frame_value
-                    - self.m_enemy_calc_frame_map[reward_name].last_frame_value
-                )
-                reward_struct.value = reward_struct.cur_frame_value - reward_struct.last_frame_value
-            reward_dict[reward_name] = reward_struct.value
-        reward_groups, reward_sum = self._compose_weighted_reward_groups()
-        reward_dict["reward_groups"] = reward_groups
-        reward_dict["reward_sum"] = reward_sum
+        # Main deltas/potentials.
+        tower_score = _hp_rate(own_tower) - _hp_rate(enemy_tower)
+        hp_score = _hp_rate(hero) - _hp_rate(enemy)
+        money_score = float(_get_any(hero, "money_cnt", "money", default=0) or 0)
+        exp_score = float(_get_any(hero, "level", default=0) or 0) * 2000.0 + float(_get_any(hero, "exp", default=0) or 0)
+        kill_cnt = float(_get_any(hero, "kill_cnt", default=0) or 0)
+        death_cnt = float(_get_any(hero, "dead_cnt", default=0) or 0)
+        total_damage = float(_get_any(hero, "total_hurt", default=0) or 0)
+        hero_damage = float(_get_any(hero, "total_hurt_to_hero", default=0) or 0)
+        hero_hurt = float(_get_any(hero, "total_be_hurt_by_hero", default=0) or 0)
+
+        enemy_count, friendly_count = len(enemy_soldiers), len(friendly_soldiers)
+        total_soldier_count = enemy_count + friendly_count
+        if not self.has_seen_minions and total_soldier_count > 0:
+            self.has_seen_minions = True
+            self.prev_enemy_soldier_count = enemy_count
+            self.prev_friendly_soldier_count = friendly_count
+            enemy_soldier_reduced = 0.0
+            lane_adv_delta = 0.0
+        else:
+            enemy_soldier_reduced = max(0.0, float(self.prev_enemy_soldier_count - enemy_count))
+            prev_adv = self.prev_friendly_soldier_count - self.prev_enemy_soldier_count
+            cur_adv = friendly_count - enemy_count
+            lane_adv_delta = float(cur_adv - prev_adv)
+        self.prev_enemy_soldier_count = enemy_count
+        self.prev_friendly_soldier_count = friendly_count
+
+        own_range = float(_get_any(own_tower, "attack_range", default=8800) or 8800)
+        enemy_near_own = [s for s in enemy_soldiers if _dist(s, own_tower) <= own_range * 1.15]
+        near_own_reduced = max(0.0, float(self.prev_near_own_enemy_soldier_count - len(enemy_near_own)))
+        self.prev_near_own_enemy_soldier_count = len(enemy_near_own)
+        enemy_ids = set(_runtime_id(s) for s in enemy_soldiers)
+        friendly_ids = set(_runtime_id(s) for s in friendly_soldiers)
+        own_tower_target_enemy_soldier = _get_any(own_tower, "attack_target", default=0) in enemy_ids
+        defense_emergency = own_tower_target_enemy_soldier or len(enemy_near_own) > 0
+
+        stuck, grass_behavior = self._update_stuck_grass(hero, defense_emergency, enemy_soldier_reduced)
+
+        enemy_range = float(_get_any(enemy_tower, "attack_range", default=8800) or 8800)
+        in_enemy_tower = _dist(hero, enemy_tower) <= enemy_range
+        enemy_tower_target = _get_any(enemy_tower, "attack_target", default=0)
+        friendly_tanking = enemy_tower_target in friendly_ids
+        attacking_enemy_tower = _get_any(hero, "attack_target", default=0) == _runtime_id(enemy_tower)
+        tower_risk = 0.0
+        if in_enemy_tower and not friendly_tanking:
+            tower_risk -= 1.0
+        if enemy_tower_target == _runtime_id(hero):
+            tower_risk -= 2.0
+        if friendly_tanking and attacking_enemy_tower:
+            tower_risk += 0.5
+
+        defense = 0.0
+        if defense_emergency:
+            if near_own_reduced > 0:
+                defense += near_own_reduced
+            own_tower_hp_delta = self._metric("own_tower_hp_for_defense", _hp_rate(own_tower), 1.0)
+            if own_tower_hp_delta < 0:
+                defense -= 1.0
+            if _dist(hero, own_tower) > 15000 and enemy_soldier_reduced <= 0 and not self._hit_any(hero):
+                defense -= 0.2
+        else:
+            self.prev["own_tower_hp_for_defense"] = _hp_rate(own_tower)
+
+        lane_clear = enemy_soldier_reduced + lane_adv_delta * 0.3
+        if defense_emergency and near_own_reduced > 0:
+            lane_clear += 0.5 * near_own_reduced
+
+        no_ops = 1.0 if _alive(hero) and (not self._has_real_cmd(hero)) and (not self._hit_any(hero)) else 0.0
+
+        reward = {
+            "tower_hp_point": self._metric("tower_score", tower_score, 1.0),
+            "hp_point": self._metric("hp_score", hp_score, 1.0),
+            "money": self._metric("money", money_score, 500.0),
+            "exp": self._metric("exp", exp_score, 500.0),
+            "last_hit": enemy_soldier_reduced,
+            "lane_clear": lane_clear,
+            "defense": defense,
+            "cake": self._calc_cake(hero, own_cake),
+            "tower_risk": tower_risk,
+            "stuck": stuck,
+            "no_ops": no_ops,
+            "grass_behavior": grass_behavior,
+            "skill_hit": self._calc_skill_hit(hero),
+            "hero_hurt": max(0.0, self._metric("hero_hurt", hero_hurt, 20000.0)),
+            "total_damage": max(0.0, self._metric("total_damage", total_damage, 60000.0)),
+            "hero_damage": max(0.0, self._metric("hero_damage", hero_damage, 20000.0)),
+            "kill": max(0.0, self._metric("kill", kill_cnt, 1.0)),
+            "death": max(0.0, self._metric("death", death_cnt, 1.0)),
+            "bad_skill": 0.0,
+            "passive_skills": 0.0,
+            "crit": 0.0,
+            "in_grass": 0.0,
+            "forward": 0.0,
+            "ep_rate": 0.0,
+            "monster_resource": 0.0,
+        }
+
+        # Time decay for shaping items only.
+        if self.time_scale_arg > 0:
+            decay = math.pow(0.6, 1.0 * frame_no / self.time_scale_arg)
+            for key in list(reward.keys()):
+                if key not in GameConfig.NO_DECAY_REWARD_KEYS:
+                    reward[key] *= decay
+
+        reward_groups = {name: 0.0 for name in GameConfig.REWARD_GROUP_NAMES}
+        assigned = set()
+        for group, keys in GameConfig.REWARD_GROUPS.items():
+            for key in keys:
+                assigned.add(key)
+                reward_groups[group] += reward.get(key, 0.0) * GameConfig.REWARD_WEIGHT_DICT.get(key, 0.0)
+        # Keep any later ungrouped non-zero reward in behavior_safety.
+        for key, value in reward.items():
+            if key in assigned:
+                continue
+            reward_groups["behavior_safety"] = reward_groups.get("behavior_safety", 0.0) + value * GameConfig.REWARD_WEIGHT_DICT.get(key, 0.0)
+        reward_sum = sum(reward_groups.values())
+        reward["reward_groups"] = reward_groups
+        reward["reward_objective"] = reward_groups.get("objective", 0.0)
+        reward["reward_growth_combat"] = reward_groups.get("growth_combat", 0.0)
+        reward["reward_behavior_safety"] = reward_groups.get("behavior_safety", 0.0)
+        reward["reward_sum"] = reward_sum
+        return reward

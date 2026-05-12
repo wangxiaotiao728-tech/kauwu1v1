@@ -7,10 +7,8 @@
 Author: Tencent AI Arena Authors
 """
 
-
 import os
 import time
-import random
 from agent_ppo.feature.definition import (
     sample_process,
     build_frame,
@@ -23,6 +21,58 @@ from tools.env_conf_manager import EnvConfManager
 from tools.model_pool_utils import get_valid_model_pool
 from tools.metrics_utils import get_training_metrics
 from common_python.utils.workflow_disaster_recovery import handle_disaster_recovery
+
+
+# Metrics used by monitor_builder.py. Missing keys are reported as 0.0 so panels do not disappear.
+MONITOR_KEYS = [
+    # environment
+    "reward", "episode_cnt", "frame_no", "win",
+    "my_hp", "enemy_hp", "own_tower_hp_ratio", "enemy_tower_hp_ratio",
+    "kill_count", "death_count",
+    # ppo
+    "total_loss", "value_loss", "policy_loss", "entropy_loss",
+    "approx_kl", "clip_fraction", "learning_rate", "hidden_norm", "feature_nan_count",
+    # reward groups
+    "reward_objective", "reward_growth_combat", "reward_behavior_safety",
+    "tower_hp_point", "kill", "death",
+    "money", "exp", "last_hit",
+    "hp_point", "hero_hurt", "hero_damage",
+    "lane_clear", "defense", "cake",
+    "tower_risk", "stuck", "no_ops", "grass_behavior",
+    "skill_hit", "total_damage",
+    # behavior diagnostics
+    "enemy_soldier_count", "friendly_soldier_count",
+    "target_soldier_rate", "target_enemy_rate", "target_tower_rate", "target_monster_rate",
+    "button_move_rate", "button_attack_rate", "button_none_rate",
+    "button_skill1_rate", "button_skill2_rate", "button_skill3_rate",
+    "skill_target_enemy_rate", "skill_target_soldier_rate", "skill_target_tower_rate", "skill_center_rate",
+    "stuck_count", "grass_long_stay_count", "grass_no_effective_count", "unsafe_tower_entry_count",
+    "defense_emergency_count", "enemy_soldier_near_own_tower_count",
+    "own_cake_pick_count", "low_hp_own_cake_approach_count",
+]
+
+# These keys should be averaged over the episode if emitted per decision frame.
+AVG_MONITOR_KEYS = {
+    "my_hp", "enemy_hp", "own_tower_hp_ratio", "enemy_tower_hp_ratio",
+    "enemy_soldier_count", "friendly_soldier_count",
+    "target_soldier_rate", "target_enemy_rate", "target_tower_rate", "target_monster_rate",
+    "button_move_rate", "button_attack_rate", "button_none_rate",
+    "button_skill1_rate", "button_skill2_rate", "button_skill3_rate",
+    "skill_target_enemy_rate", "skill_target_soldier_rate", "skill_target_tower_rate", "skill_center_rate",
+    "hidden_norm", "feature_nan_count",
+}
+
+REWARD_GROUPS_FOR_MONITOR = {
+    "reward_objective": ["tower_hp_point", "kill", "death"],
+    "reward_growth_combat": [
+        "hp_point", "money", "exp", "last_hit", "hero_hurt",
+        "total_damage", "hero_damage", "skill_hit",
+    ],
+    "reward_behavior_safety": [
+        "lane_clear", "defense", "cake", "tower_risk", "stuck",
+        "no_ops", "grass_behavior",
+    ],
+}
 
 
 def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
@@ -81,10 +131,10 @@ class EpisodeRunner:
         self.agent_num = len(agents)
         self.episode_cnt = 0
         self.last_report_monitor_time = 0
+        self.latest_training_metrics = {}
 
     @staticmethod
     def _safe_float(value):
-        """Convert a reward/monitor value to float safely."""
         try:
             if value is None:
                 return 0.0
@@ -98,28 +148,101 @@ class EpisodeRunner:
         except Exception:
             return 0.0
 
+    @classmethod
+    def _flatten_training_metrics(cls, metrics):
+        flat = {}
+        if not isinstance(metrics, dict):
+            return flat
+        for key, value in metrics.items():
+            if isinstance(value, dict):
+                for sub_key, sub_value in value.items():
+                    flat[sub_key] = cls._safe_float(sub_value)
+            else:
+                flat[key] = cls._safe_float(value)
+        return flat
+
     @staticmethod
-    def _get_d401_monitor_keys():
-        """D401 reward keys. Must match reward_process.py and monitor_builder.py."""
-        return [
-            "hero_hurt",
-            "total_damage",
-            "hero_damage",
-            "crit",
-            "skill_hit",
-            "no_ops",
-            "in_grass",
-            "under_tower_behavior",
-            "passive_skills",
-        ]
+    def _new_monitor_acc():
+        return {
+            "sum": {key: 0.0 for key in MONITOR_KEYS},
+            "cnt": {key: 0 for key in MONITOR_KEYS},
+        }
 
     @classmethod
-    def _accumulate_reward_items(cls, acc_dict, reward_dict):
-        """Accumulate D401 reward items over one episode."""
-        if not isinstance(reward_dict, dict):
+    def _accumulate_monitor_items(cls, acc, data):
+        if not isinstance(data, dict):
             return
-        for key in cls._get_d401_monitor_keys():
-            acc_dict[key] = acc_dict.get(key, 0.0) + cls._safe_float(reward_dict.get(key, 0.0))
+        for key in MONITOR_KEYS:
+            if key in data:
+                acc["sum"][key] += cls._safe_float(data.get(key, 0.0))
+                acc["cnt"][key] += 1
+
+    @classmethod
+    def _finalize_monitor_items(cls, acc):
+        out = {}
+        for key in MONITOR_KEYS:
+            if key in AVG_MONITOR_KEYS:
+                cnt = max(1, acc["cnt"].get(key, 0))
+                out[key] = acc["sum"].get(key, 0.0) / cnt
+            else:
+                out[key] = acc["sum"].get(key, 0.0)
+        # If reward process did not directly emit grouped rewards, build them from item sums.
+        for group_key, item_keys in REWARD_GROUPS_FOR_MONITOR.items():
+            if abs(out.get(group_key, 0.0)) < 1e-12:
+                out[group_key] = sum(out.get(item_key, 0.0) for item_key in item_keys)
+        return out
+
+    def _extract_env_monitor_items(self, frame_state, monitor_side):
+        """Extract low-cost environment metrics for panels."""
+        data = {}
+        try:
+            hero_states = frame_state.get("hero_states", [])
+            npc_states = frame_state.get("npc_states", [])
+            main_camp = None
+            my_hero = None
+            enemy_hero = None
+            for hero in hero_states:
+                # reward manager main camp is based on agent; monitor_side observation is already local.
+                # Here use the first matching runtime from observation perspective when possible.
+                if my_hero is None:
+                    my_hero = hero
+                    main_camp = hero.get("camp", None)
+                elif hero.get("camp") != main_camp:
+                    enemy_hero = hero
+            if my_hero:
+                data["my_hp"] = self._safe_float(my_hero.get("hp", 0)) / max(1.0, self._safe_float(my_hero.get("max_hp", 1)))
+                data["kill_count"] = self._safe_float(my_hero.get("kill_cnt", 0))
+                data["death_count"] = self._safe_float(my_hero.get("dead_cnt", 0))
+            if enemy_hero:
+                data["enemy_hp"] = self._safe_float(enemy_hero.get("hp", 0)) / max(1.0, self._safe_float(enemy_hero.get("max_hp", 1)))
+            own_tower = None
+            enemy_tower = None
+            friendly_soldiers = 0
+            enemy_soldiers = 0
+            for npc in npc_states:
+                sub_type = int(npc.get("sub_type", -1))
+                hp = self._safe_float(npc.get("hp", 0))
+                if hp <= 0:
+                    continue
+                if sub_type == 21:
+                    if npc.get("camp") == main_camp:
+                        own_tower = npc
+                    else:
+                        enemy_tower = npc
+                elif sub_type == 11:
+                    if npc.get("camp") == main_camp:
+                        friendly_soldiers += 1
+                    else:
+                        enemy_soldiers += 1
+            if own_tower:
+                data["own_tower_hp_ratio"] = self._safe_float(own_tower.get("hp", 0)) / max(1.0, self._safe_float(own_tower.get("max_hp", 1)))
+            if enemy_tower:
+                data["enemy_tower_hp_ratio"] = self._safe_float(enemy_tower.get("hp", 0)) / max(1.0, self._safe_float(enemy_tower.get("max_hp", 1)))
+            data["friendly_soldier_count"] = friendly_soldiers
+            data["enemy_soldier_count"] = enemy_soldiers
+        except Exception:
+            pass
+        return data
 
     def _call_init_config(self, usr_conf):
         """Call init_config on both agents to get summoner skill selections,
@@ -130,7 +253,6 @@ class EpisodeRunner:
 
         # camp_keys[i] is the camp key for agents[i] based on monitor_side
         # monitor_side 的 agent 对应 blue/red 取决于 monitor_side 配置
-        monitor_side = self.env_conf_manager.get_monitor_side()
         camp_keys = ["blue_camp", "red_camp"]
 
         for agent_idx, agent in enumerate(self.agents):
@@ -165,8 +287,9 @@ class EpisodeRunner:
             # 获取训练中的指标
             training_metrics = get_training_metrics()
             if training_metrics:
+                self.latest_training_metrics = self._flatten_training_metrics(training_metrics)
                 for key, value in training_metrics.items():
-                    if key == "env":
+                    if key == "env" and isinstance(value, dict):
                         for env_key, env_value in value.items():
                             self.logger.info(f"training_metrics {key} {env_key} is {env_value}")
                     else:
@@ -184,7 +307,6 @@ class EpisodeRunner:
 
             # Start a new environment
             # 启动新对局，返回初始环境状态
-
             env_obs = self.env.reset(usr_conf=usr_conf)
             # Disaster recovery
             # 容灾
@@ -192,7 +314,6 @@ class EpisodeRunner:
                 break
 
             observation = env_obs["observation"]
-            extra_info = env_obs["extra_info"]
 
             # Reset agents
             # 重置智能体
@@ -206,8 +327,8 @@ class EpisodeRunner:
             # 对局变量
             self.episode_cnt += 1
             frame_no = 0
-            reward_sum_list = [0] * self.agent_num
-            reward_item_sum_list = [dict() for _ in range(self.agent_num)]
+            reward_sum_list = [0.0] * self.agent_num
+            monitor_acc_list = [self._new_monitor_acc() for _ in range(self.agent_num)]
             is_train_test = os.environ.get("is_train_test", "False").lower() == "true"
             self.logger.info(f"Episode {self.episode_cnt} start, usr_conf is {usr_conf}")
 
@@ -215,10 +336,12 @@ class EpisodeRunner:
             # 回报初始化
             for i, (do_sample, agent) in enumerate(zip(self.do_samples, self.agents)):
                 if do_sample:
-                    reward = agent.reward_manager.result(observation[str(i)]["frame_state"])
+                    frame_state = observation[str(i)]["frame_state"]
+                    reward = agent.reward_manager.result(frame_state)
                     observation[str(i)]["reward"] = reward
-                    reward_sum_list[i] += reward.get("reward_sum", 0.0)
-                    self._accumulate_reward_items(reward_item_sum_list[i], reward)
+                    reward_sum_list[i] += self._safe_float(reward.get("reward_sum", 0.0))
+                    self._accumulate_monitor_items(monitor_acc_list[i], reward)
+                    self._accumulate_monitor_items(monitor_acc_list[i], self._extract_env_monitor_items(frame_state, i))
 
             while True:
                 # Initialize the default actions. If the agent does not make a decision, env.step uses the default action.
@@ -250,7 +373,6 @@ class EpisodeRunner:
 
                 frame_no = env_obs["frame_no"]
                 observation = env_obs["observation"]
-                extra_info = env_obs["extra_info"]
                 terminated = env_obs["terminated"]
                 truncated = env_obs["truncated"]
 
@@ -258,10 +380,12 @@ class EpisodeRunner:
                 # 计算回报，作为当前环境状态observation的一部分
                 for i, (do_sample, agent) in enumerate(zip(self.do_samples, self.agents)):
                     if do_sample:
-                        reward = agent.reward_manager.result(observation[str(i)]["frame_state"])
+                        frame_state = observation[str(i)]["frame_state"]
+                        reward = agent.reward_manager.result(frame_state)
                         observation[str(i)]["reward"] = reward
-                        reward_sum_list[i] += reward.get("reward_sum", 0.0)
-                        self._accumulate_reward_items(reward_item_sum_list[i], reward)
+                        reward_sum_list[i] += self._safe_float(reward.get("reward_sum", 0.0))
+                        self._accumulate_monitor_items(monitor_acc_list[i], reward)
+                        self._accumulate_monitor_items(monitor_acc_list[i], self._extract_env_monitor_items(frame_state, i))
 
                 # Normal end or timeout exit, run train_test will exit early
                 # 正常结束或超时退出，运行train_test时会提前退出
@@ -276,23 +400,24 @@ class EpisodeRunner:
                         if not is_eval and do_sample:
                             frame_collector.save_last_frame(
                                 agent_id=i,
-                                reward=observation[str(i)]["reward"]["reward_sum"],
+                                reward=observation[str(i)]["reward"].get("reward_sum", 0.0),
                             )
 
                     now = time.time()
                     if now - self.last_report_monitor_time >= 60:
+                        monitor_data = self._finalize_monitor_items(monitor_acc_list[monitor_side])
+                        monitor_data.update({
+                            "episode_cnt": self.episode_cnt,
+                            "frame_no": frame_no,
+                            "reward": round(reward_sum_list[monitor_side], 2),
+                            "win": 1.0 if self._safe_float(reward_sum_list[monitor_side]) > 0 else 0.0,
+                        })
+                        # Merge learner-side PPO metrics if available.
+                        for key in MONITOR_KEYS:
+                            if key in self.latest_training_metrics:
+                                monitor_data[key] = self.latest_training_metrics[key]
+
                         if self.monitor:
-                            monitor_data = {
-                                "episode_cnt": int(self.episode_cnt),
-                                # Report reward for both training and eval episodes.
-                                "reward": round(float(reward_sum_list[monitor_side]), 4),
-                            }
-
-                            # Report whole-episode accumulated D401 reward items.
-                            side_reward_items = reward_item_sum_list[monitor_side]
-                            for key in self._get_d401_monitor_keys():
-                                monitor_data[key] = round(float(side_reward_items.get(key, 0.0)), 4)
-
                             self.monitor.put_data({os.getpid(): monitor_data})
                             self.last_report_monitor_time = now
 
@@ -344,7 +469,7 @@ class EpisodeRunner:
                         if is_train_test:
                             # Run train_test, cannot get opponent agent, so replace with latest model
                             # 运行 train_test 时, 无法获取到对手模型，因此将替换为最新模型
-                            self.logger.info(f"Run train_test, cannot get opponent agent, so replace with latest model")
+                            self.logger.info("Run train_test, cannot get opponent agent, so replace with latest model")
                             agent.load_model(id="latest")
                         else:
                             agent.load_opponent_agent(id=opponent_agent)

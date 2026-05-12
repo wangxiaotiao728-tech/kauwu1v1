@@ -3,129 +3,151 @@
 ###########################################################################
 # Copyright © 1998 - 2026 Tencent. All Rights Reserved.
 ###########################################################################
-"""Full D401 replication configuration.
+"""Final D401-256 configuration.
 
-This branch intentionally keeps the baseline 10-dim feature protocol to focus on
-replicating the previous solution's late-stage algorithmic improvements:
-- true LSTM sequence training
-- grouped encoders + target attention
-- D401 reward items
-- full multi-critic/group-return GAE
-- value clipping, optional dual-clip PPO
-- LR / entropy / clip scheduling
-- in-game reward decay and reward grouping
+This version uses real protocol fields observed in the 1v1 environment:
+- 256-dim feature vector grouped by hero/enemy/skill/lane/objective/target/history.
+- 3 reward groups: objective, growth_combat, behavior_safety.
+- LSTM384 grouped model.
+- Conservative PPO schedules for the larger feature/network version.
 """
 
 
 class GameConfig:
+    # ===== Confirmed ids from real frame_state =====
+    HERO_LUBAN_ID = 112
+    HERO_DIRENJIE_ID = 133
+
+    SOLDIER_SUB_TYPES = {11}
+    SOLDIER_CONFIG_IDS = {6800, 6801, 6803, 6804}
+
+    TOWER_SUB_TYPES = {21}
+    TOWER_CONFIG_IDS = {1111, 1112}
+
+    EXCLUDED_NPC_SUB_TYPES = {23, 24}
+    BASE_OR_SPRING_CONFIG_IDS = {44, 46, 1113, 1114}
+
+    MONSTER_CONFIG_IDS = {6827}
+    CAKE_CONFIG_IDS = {5}
+    OWN_CAKE_ONLY = True
+    CAKE_LOW_HP_THRESHOLD = 0.40
+    CAKE_MEDIUM_HP_THRESHOLD = 0.60
+
+    # Button ids are environment dependent. These defaults match the common 1v1
+    # baseline layout used by this starter: None, Move, Attack, Skill1, Skill2,
+    # Skill3, Recover, Summoner, Recall. If your local action definition differs,
+    # change only these constants.
+    BUTTON_NONE = 0
+    BUTTON_MOVE = 1
+    BUTTON_ATTACK = 2
+    BUTTON_SKILL1 = 3
+    BUTTON_SKILL2 = 4
+    BUTTON_SKILL3 = 5
+    BUTTON_RECOVER = 6
+    BUTTON_SUMMONER = 7
+    BUTTON_RECALL = 8
+
+    TARGET_NONE = 0
+    TARGET_ENEMY = 1
+    TARGET_SELF = 2
+    TARGET_SOLDIER_0 = 3
+    TARGET_SOLDIER_1 = 4
+    TARGET_SOLDIER_2 = 5
+    TARGET_SOLDIER_3 = 6
+    TARGET_TOWER = 7
+    TARGET_MONSTER = 8
+
+    # Reward weights. Items with weight 0 are kept only for compatibility/monitor.
     REWARD_WEIGHT_DICT = {
-        # Baseline/objective rewards
+        # objective
         "tower_hp_point": 8.0,
+        "kill": 1.0,
+        "death": -1.0,
+        # growth / combat
         "hp_point": 1.0,
         "money": 0.05,
         "exp": 0.05,
-        "kill": 1.0,
-        "death": -1.0,
-        "forward": 0.015,
-        "ep_rate": 0.01,
         "last_hit": 0.06,
-        # Targeted fixes for the observed issue: lane ignorance and random skill use.
-        # lane_clear is a result-style lane advantage reward, not per-HP damage shaping.
-        "lane_clear": 0.12,
-        # bad_skill is a small penalty for increasing usedTimes without hitHeroTimes.
-        "bad_skill": -0.005,
-        # D401 replica rewards
         "hero_hurt": -0.10,
         "total_damage": 0.03,
         "hero_damage": 0.05,
-        "crit": 0.01,
-        "skill_hit": 0.03,
+        "skill_hit": 0.02,
+        # behavior / safety
+        "lane_clear": 0.12,
+        "defense": 0.08,
+        "cake": 0.05,
+        "tower_risk": 0.03,
+        "stuck": -0.03,
         "no_ops": -0.005,
-        "in_grass": 0.001,
-        "under_tower_behavior": 0.15,
+        "grass_behavior": 0.03,
+        # disabled / monitor-only
+        "bad_skill": 0.0,
         "passive_skills": 0.0,
+        "crit": 0.0,
+        "in_grass": 0.0,
+        # optional old baseline keys kept off
+        "forward": 0.0,
+        "ep_rate": 0.0,
+        "monster_resource": 0.0,
     }
 
-    # Full D401-style reward groups. Each group gets its own return/advantage
-    # and value head. The policy advantage is a weighted sum of group advantages.
     REWARD_GROUPS = {
-        "decay": [
+        "objective": ["tower_hp_point", "kill", "death"],
+        "growth_combat": [
+            "hp_point",
             "money",
             "exp",
             "last_hit",
-            "lane_clear",
-            "forward",
-            "ep_rate",
-            "total_damage",
             "hero_hurt",
+            "total_damage",
             "hero_damage",
-            "crit",
             "skill_hit",
-            "bad_skill",
-            "in_grass",
-            "no_ops",
-            "under_tower_behavior",
-            "passive_skills",
         ],
-        "no_decay": ["death", "kill", "hp_point", "tower_hp_point"],
+        "behavior_safety": [
+            "lane_clear",
+            "defense",
+            "cake",
+            "tower_risk",
+            "stuck",
+            "no_ops",
+            "grass_behavior",
+        ],
     }
     REWARD_GROUP_NAMES = list(REWARD_GROUPS.keys())
-    REWARD_GROUP_ADV_WEIGHTS = {"decay": 1.0, "no_decay": 1.0}
-    NO_DECAY_REWARD_KEYS = set(REWARD_GROUPS["no_decay"])
+    REWARD_GROUP_ADV_WEIGHTS = {"objective": 1.0, "growth_combat": 1.0, "behavior_safety": 1.0}
+    NO_DECAY_REWARD_KEYS = set(REWARD_GROUPS["objective"])
 
-    # D401 report uses time decay for non-critical in-game rewards.
-    # 0 disables it; 20000 matches the official max-frame horizon.
+    # 0 disables decay. Keep a mild decay for shaping terms only.
     TIME_SCALE_ARG = 20000
     MODEL_SAVE_INTERVAL = 1800
 
-    # Official-protocol strict NPC type configuration.
-    # String enum names are handled directly. Numeric enum values vary by environment
-    # build, so only the known baseline tower value is enabled by default. Fill
-    # SOLDIER_SUB_TYPES / MONSTER_ACTOR_TYPES after checking NPC_SCAN logs if the
-    # environment provides integer enum values.
-    TOWER_SUB_TYPES = {21}
-    SOLDIER_SUB_TYPES = set()
-    MONSTER_ACTOR_TYPES = set()
-    SOLDIER_CONFIG_IDS = set()
-    MONSTER_CONFIG_IDS = set()
+    # Debug switches.
     DEBUG_NPC_SCAN = False
-    DEBUG_NPC_SCAN_MAX_FRAME = 200
+    DEBUG_NPC_SCAN_MAX_FRAME = 3000
+    DEBUG_FEATURE_CHECK = False
 
 
 class DimConfig:
-    # Expanded D401-compatible feature dim.
-    # 128 dims provide lane/skill/tower/target state needed by the current reward design.
-    DIM_OF_FEATURE = [128]
+    DIM_OF_FEATURE = [256]
 
 
 class Config:
     NETWORK_NAME = "network"
     LSTM_TIME_STEPS = 16
-    LSTM_UNIT_SIZE = 512
+    LSTM_UNIT_SIZE = 384
+    FUSION_DIM = 512
 
     LABEL_SIZE_LIST = [12, 16, 16, 16, 16, 9]
     IS_REINFORCE_TASK_LIST = [True, True, True, True, True, True]
 
     FEATURE_DIM = DimConfig.DIM_OF_FEATURE[0]
-    # Feature layout: self(16), enemy(24), skills(20), lane(28), tower(16), target(16), history(8)
-    FEATURE_GROUP_SIZES = [16, 24, 20, 28, 16, 16, 8]
+    FEATURE_GROUP_SIZES = [32, 32, 56, 40, 32, 40, 24]
     LEGAL_ACTION_DIM = 85
+
     REWARD_GROUP_NAMES = GameConfig.REWARD_GROUP_NAMES
     REWARD_GROUP_NUM = len(REWARD_GROUP_NAMES)
     REWARD_GROUP_ADV_WEIGHTS = [GameConfig.REWARD_GROUP_ADV_WEIGHTS.get(name, 1.0) for name in REWARD_GROUP_NAMES]
 
-    # One-frame layout before LSTM packing:
-    # 0 seri_vec(feature+legal)
-    # 1 global return, 2 global advantage
-    # 3..3+G-1 group returns
-    # next G group advantages
-    # next 6 action labels
-    # next 6 old action probabilities
-    # next 6 branch weights/sub-action mask
-    # next 1 old global value
-    # next G old group values
-    # next 1 is_train
-    # final two entries are sequence initial lstm cell/hidden and are NOT repeated by T.
     DATA_SPLIT_SHAPE = (
         [FEATURE_DIM + LEGAL_ACTION_DIM, 1, 1]
         + [1] * REWARD_GROUP_NUM
@@ -140,14 +162,20 @@ class Config:
     )
     SERI_VEC_SPLIT_SHAPE = [(FEATURE_DIM,), (LEGAL_ACTION_DIM,)]
 
-    INIT_LEARNING_RATE_START = 2e-4
-    TARGET_LR = 8e-5
-    TARGET_STEP = 50000
-    BETA_START = 0.010
+    # LR schedule: warmup to BASE_LR, then cosine decay. The existing Agent uses
+    # LambdaLR, so these values are consumed in Agent.lr_lambda.
+    INIT_LEARNING_RATE_START = 1e-4
+    WARMUP_LR = 3e-5
+    WARMUP_STEPS = 3000
+    MIN_LR = 3e-5
+    TARGET_LR = MIN_LR
+    TARGET_STEP = 120000
+
+    BETA_START = 0.008
     TARGET_BETA = 0.003
     LOG_EPSILON = 1e-6
     CLIP_PARAM = 0.18
-    TARGET_CLIP_PARAM = 0.12
+    TARGET_CLIP_PARAM = 0.15
     PPO_EPOCH = 1
 
     USE_DUAL_CLIP = True
@@ -161,7 +189,6 @@ class Config:
     MIN_POLICY = 0.00001
     TARGET_EMBED_DIM = 64
 
-    # Packed shapes over LSTM_TIME_STEPS for all non-LSTM-state fields.
     data_shapes = []
     for shape in DATA_SPLIT_SHAPE[:-2]:
         data_shapes.append([shape * LSTM_TIME_STEPS])

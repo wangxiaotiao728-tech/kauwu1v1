@@ -14,6 +14,7 @@ torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 
 import os
+import math
 import random
 from agent_ppo.model.model import Model
 from agent_ppo.feature.definition import *
@@ -89,12 +90,20 @@ class Agent(BaseAgent):
         super().__init__(agent_type, device, logger, monitor)
 
     def lr_lambda(self, step):
-        # Define learning rate decay function
-        # 定义学习率衰减函数
-        if step > self.target_step:
-            return self.target_lr / self.lr
+        # Warmup + cosine decay, returning a multiplier for LambdaLR.
+        base_lr = float(getattr(Config, "INIT_LEARNING_RATE_START", self.lr))
+        warmup_lr = float(getattr(Config, "WARMUP_LR", base_lr))
+        min_lr = float(getattr(Config, "MIN_LR", getattr(Config, "TARGET_LR", base_lr)))
+        warmup_steps = int(getattr(Config, "WARMUP_STEPS", 0))
+        total_steps = max(1, int(getattr(Config, "TARGET_STEP", 1)))
+        if warmup_steps > 0 and step < warmup_steps:
+            ratio = step / max(1, warmup_steps)
+            lr = warmup_lr + ratio * (base_lr - warmup_lr)
         else:
-            return 1.0 - ((1.0 - self.target_lr / self.lr) * step / self.target_step)
+            progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            lr = min_lr + cosine * (base_lr - min_lr)
+        return lr / max(base_lr, 1e-12)
 
     def init_config(self, config_data):
         # Select summoner skill for each hero based on hero lineup of both camps
@@ -153,7 +162,9 @@ class Agent(BaseAgent):
 
         list_act_data = list()
         for i in range(len(legal_action)):
-            prob, d_prob, action, d_action = self._sample_masked_action(logits[i], legal_action[i])
+            context = getattr(self.feature_processes, "last_context", {}) if hasattr(self, "feature_processes") else {}
+            biased_logits = self._apply_action_bias(logits[i].copy(), context)
+            prob, d_prob, action, d_action = self._sample_masked_action(biased_logits, legal_action[i])
             list_act_data.append(
                 ActData(
                     action=action,
@@ -246,6 +257,72 @@ class Agent(BaseAgent):
         self.act_data = act_data
         self.lstm_cell = act_data.lstm_cell
         self.lstm_hidden = act_data.lstm_hidden
+
+
+    def _apply_action_bias(self, logits, context):
+        """Apply small, train/eval-consistent logits biases.
+
+        Bias is applied before sampling/argmax so PPO probabilities match the
+        executed action. Button ids are configurable in GameConfig.
+        """
+        from agent_ppo.conf.conf import GameConfig
+
+        split = np.split(logits, [sum(self.label_size_list[: i + 1]) for i in range(len(self.label_size_list) - 1)])
+        button_logits, move_x_logits, move_z_logits, skill_x_logits, skill_z_logits, target_logits = split
+
+        def add(arr, idx, val):
+            if 0 <= idx < len(arr):
+                arr[idx] += val
+
+        enemy_visible = float(context.get("enemy_visible", 0.0)) > 0.5
+        enemy_dist = float(context.get("enemy_dist", 1e9))
+        enemy_soldier_count = float(context.get("enemy_soldier_count", 0.0))
+        friendly_tanking = float(context.get("friendly_soldier_tanking_enemy_tower", 0.0)) > 0.5
+        stuck_score = float(context.get("stuck_score", 0.0))
+        defense_emergency = float(context.get("defense_emergency", 0.0)) > 0.5
+        grass_no_effective_steps = float(context.get("grass_no_effective_steps", 0.0))
+        is_in_grass = float(context.get("is_in_grass", 0.0)) > 0.5
+        unsafe_tower_entry = float(context.get("unsafe_tower_entry", 0.0)) > 0.5
+        my_hp_ratio = float(context.get("my_hp_ratio", 1.0))
+        own_cake_exists = float(context.get("own_cake_exists", 0.0)) > 0.5
+
+        # Skill offset should initially aim near target center.
+        center = 8
+        for j in range(16):
+            bias = max(0.0, 0.8 - 0.2 * abs(j - center))
+            skill_x_logits[j] += bias
+            skill_z_logits[j] += bias
+
+        # Target preferences.
+        if enemy_visible and enemy_dist < 12000:
+            add(target_logits, GameConfig.TARGET_ENEMY, 0.8)
+        if defense_emergency or enemy_soldier_count > 0:
+            add(target_logits, GameConfig.TARGET_SOLDIER_0, 0.5)
+            add(target_logits, GameConfig.TARGET_SOLDIER_1, 0.3)
+        if friendly_tanking:
+            add(target_logits, GameConfig.TARGET_TOWER, 0.8)
+        if not enemy_visible:
+            add(target_logits, GameConfig.TARGET_ENEMY, -1.0)
+            add(button_logits, GameConfig.BUTTON_SKILL3, -1.0)
+
+        # Stuck / grass anti-idle bias.
+        if stuck_score > 0.5 or (is_in_grass and grass_no_effective_steps > 6):
+            add(button_logits, GameConfig.BUTTON_MOVE, 0.8)
+            add(button_logits, GameConfig.BUTTON_ATTACK, 0.3)
+            add(button_logits, GameConfig.BUTTON_NONE, -1.0)
+            add(button_logits, GameConfig.BUTTON_RECALL, -1.0)
+
+        # Low-hp cake bias: only movement; own-cake direction should be handled by move feature.
+        if my_hp_ratio < 0.4 and own_cake_exists:
+            add(button_logits, GameConfig.BUTTON_MOVE, 0.5)
+
+        # Light tower safety bias.
+        if unsafe_tower_entry:
+            add(button_logits, GameConfig.BUTTON_MOVE, 0.5)
+            add(target_logits, GameConfig.TARGET_TOWER, -0.4)
+            add(target_logits, GameConfig.TARGET_ENEMY, -0.3)
+
+        return np.concatenate([button_logits, move_x_logits, move_z_logits, skill_x_logits, skill_z_logits, target_logits], axis=0)
 
     def _sample_masked_action(self, logits, legal_action):
         """

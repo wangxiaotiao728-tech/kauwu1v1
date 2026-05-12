@@ -171,7 +171,9 @@ class FrameCollector:
             last_rl_data_info.reward = self._clip_reward(float(reward))
             # Terminal scalar rewards are distributed into the no_decay group if present.
             terminal_groups = np.zeros([Config.REWARD_GROUP_NUM], dtype=np.float32)
-            if "no_decay" in Config.REWARD_GROUP_NAMES:
+            if "objective" in Config.REWARD_GROUP_NAMES:
+                terminal_groups[Config.REWARD_GROUP_NAMES.index("objective")] = float(reward)
+            elif "no_decay" in Config.REWARD_GROUP_NAMES:
                 terminal_groups[Config.REWARD_GROUP_NAMES.index("no_decay")] = float(reward)
             last_rl_data_info.group_reward = self._clip_group_reward(terminal_groups)
 

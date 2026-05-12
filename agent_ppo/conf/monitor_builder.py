@@ -4,179 +4,91 @@
 # Copyright © 1998 - 2026 Tencent. All Rights Reserved.
 ###########################################################################
 """
-D401 replica monitor builder.
-Keep the original baseline chain style and only append D401 reward item panels.
+Monitor builder for 1v1 PPO.
+- Legal Chinese names: only Chinese/English/digits/_-/space, length <= 20.
+- Related metrics are placed in the same line panel for easier comparison.
 """
 
 from kaiwudrl.common.monitor.monitor_config_builder import MonitorConfigBuilder
 
 
-def build_monitor():
-    """
-    Create custom monitor panel configurations.
+def _precision(metric):
+    if metric == "learning_rate":
+        return "0.00000001"
+    if metric.endswith("_rate") or metric.endswith("_ratio") or metric in {"win", "approx_kl", "clip_fraction"}:
+        return "0.0001"
+    return "0.01"
 
-    Baseline metrics:
-        reward, total_loss, value_loss, policy_loss, entropy_loss
-    D401 reward item metrics:
-        hero_hurt, total_damage, hero_damage, crit, skill_hit,
-        no_ops, in_grass, under_tower_behavior, passive_skills
-    """
+
+def _add_multi_metric_panels(builder, panels):
+    """Add panels. Each panel can contain one or more line metrics."""
+    for panel_name, panel_name_en, metrics in panels:
+        builder = builder.add_panel(
+            name=panel_name,
+            name_en=panel_name_en,
+            type="line",
+        )
+        for metric in metrics:
+            builder = builder.add_metric(
+                metrics_name=metric,
+                expr=f"round(avg({metric}{{}}), {_precision(metric)})",
+            )
+        builder = builder.end_panel()
+    return builder
+
+
+def build_monitor():
     monitor = MonitorConfigBuilder()
 
-    config_dict = (
-        monitor.title("智能决策1v1")
-        .add_group(
-            group_name="算法指标",
-            group_name_en="algorithm",
-        )
-        # ===== Baseline original panels =====
-        .add_panel(
-            name="累积回报",
-            name_en="reward",
-            type="line",
-        )
-        .add_metric(
-            metrics_name="reward",
-            expr="round(avg(reward{}), 0.01)",
-        )
-        .end_panel()
-        .add_panel(
-            name="总损失",
-            name_en="total_loss",
-            type="line",
-        )
-        .add_metric(
-            metrics_name="total_loss",
-            expr="round(avg(total_loss{}), 0.01)",
-        )
-        .end_panel()
-        .add_panel(
-            name="价值损失",
-            name_en="value_loss",
-            type="line",
-        )
-        .add_metric(
-            metrics_name="value_loss",
-            expr="round(avg(value_loss{}), 0.01)",
-        )
-        .end_panel()
-        .add_panel(
-            name="策略损失",
-            name_en="policy_loss",
-            type="line",
-        )
-        .add_metric(
-            metrics_name="policy_loss",
-            expr="round(avg(policy_loss{}), 0.01)",
-        )
-        .end_panel()
-        .add_panel(
-            name="熵损失",
-            name_en="entropy_loss",
-            type="line",
-        )
-        .add_metric(
-            metrics_name="entropy_loss",
-            expr="round(avg(entropy_loss{}), 0.01)",
-        )
-        .end_panel()
-        .end_group()
-        # ===== D401 reward item panels =====
-        .add_group(
-            group_name="D401奖励",
-            group_name_en="d401_reward",
-        )
-        .add_panel(
-            name="承伤",
-            name_en="hero_hurt",
-            type="line",
-        )
-        .add_metric(
-            metrics_name="hero_hurt",
-            expr="round(avg(hero_hurt{}), 0.01)",
-        )
-        .end_panel()
-        .add_panel(
-            name="总伤",
-            name_en="total_damage",
-            type="line",
-        )
-        .add_metric(
-            metrics_name="total_damage",
-            expr="round(avg(total_damage{}), 0.01)",
-        )
-        .end_panel()
-        .add_panel(
-            name="英伤",
-            name_en="hero_damage",
-            type="line",
-        )
-        .add_metric(
-            metrics_name="hero_damage",
-            expr="round(avg(hero_damage{}), 0.01)",
-        )
-        .end_panel()
-        .add_panel(
-            name="暴击",
-            name_en="crit",
-            type="line",
-        )
-        .add_metric(
-            metrics_name="crit",
-            expr="round(avg(crit{}), 0.01)",
-        )
-        .end_panel()
-        .add_panel(
-            name="技命中",
-            name_en="skill_hit",
-            type="line",
-        )
-        .add_metric(
-            metrics_name="skill_hit",
-            expr="round(avg(skill_hit{}), 0.01)",
-        )
-        .end_panel()
-        .add_panel(
-            name="无操作",
-            name_en="no_ops",
-            type="line",
-        )
-        .add_metric(
-            metrics_name="no_ops",
-            expr="round(avg(no_ops{}), 0.01)",
-        )
-        .end_panel()
-        .add_panel(
-            name="草丛",
-            name_en="in_grass",
-            type="line",
-        )
-        .add_metric(
-            metrics_name="in_grass",
-            expr="round(avg(in_grass{}), 0.01)",
-        )
-        .end_panel()
-        .add_panel(
-            name="塔下",
-            name_en="under_tower_behavior",
-            type="line",
-        )
-        .add_metric(
-            metrics_name="under_tower_behavior",
-            expr="round(avg(under_tower_behavior{}), 0.01)",
-        )
-        .end_panel()
-        .add_panel(
-            name="被动",
-            name_en="passive_skills",
-            type="line",
-        )
-        .add_metric(
-            metrics_name="passive_skills",
-            expr="round(avg(passive_skills{}), 0.01)",
-        )
-        .end_panel()
-        .end_group()
-        .build()
-    )
-    return config_dict
+    environment_panels = [
+        ("塔血对比", "tower_compare", ["own_tower_hp_ratio", "enemy_tower_hp_ratio"]),
+        ("英雄血量", "hero_hp", ["my_hp", "enemy_hp"]),
+        ("击杀死亡", "kill_death", ["kill_count", "death_count"]),
+        ("胜率", "win", ["win"]),
+        ("总奖励", "reward", ["reward"]),
+        ("对局信息", "episode_info", ["episode_cnt", "frame_no"]),
+    ]
+
+    ppo_panels = [
+        ("损失对比", "loss_compare", ["total_loss", "value_loss", "policy_loss"]),
+        ("PPO稳定", "ppo_stable", ["approx_kl", "clip_fraction"]),
+        ("熵损失", "entropy_loss", ["entropy_loss"]),
+        ("学习率", "learning_rate", ["learning_rate"]),
+        ("训练健康", "train_health", ["hidden_norm", "feature_nan_count"]),
+    ]
+
+    reward_panels = [
+        ("奖励三组", "reward_groups", ["reward_objective", "reward_growth_combat", "reward_behavior_safety"]),
+        ("目标奖励", "objective_reward", ["tower_hp_point", "kill", "death"]),
+        ("发育奖励", "growth_reward", ["money", "exp", "last_hit"]),
+        ("血量伤害", "combat_reward", ["hp_point", "hero_hurt", "hero_damage"]),
+        ("清线防守", "lane_defense", ["lane_clear", "defense", "cake"]),
+        ("风险行为", "risk_behavior", ["tower_risk", "stuck", "no_ops", "grass_behavior"]),
+        ("技能奖励", "skill_reward", ["skill_hit", "total_damage"]),
+    ]
+
+    behavior_panels = [
+        ("兵线数量", "soldier_count", ["enemy_soldier_count", "friendly_soldier_count"]),
+        ("目标选择", "target_select", ["target_soldier_rate", "target_enemy_rate", "target_tower_rate", "target_monster_rate"]),
+        ("基础动作", "basic_action", ["button_move_rate", "button_attack_rate", "button_none_rate"]),
+        ("技能动作", "skill_action", ["button_skill1_rate", "button_skill2_rate", "button_skill3_rate"]),
+        ("技能目标", "skill_target", ["skill_target_enemy_rate", "skill_target_soldier_rate", "skill_target_tower_rate", "skill_center_rate"]),
+        ("异常行为", "bad_behavior", ["stuck_count", "grass_long_stay_count", "grass_no_effective_count", "unsafe_tower_entry_count"]),
+        ("防守行为", "defense_behavior", ["defense_emergency_count", "enemy_soldier_near_own_tower_count"]),
+        ("血包行为", "cake_behavior", ["own_cake_pick_count", "low_hp_own_cake_approach_count"]),
+    ]
+
+    builder = monitor.title("智能决策1v1")
+    builder = builder.add_group(group_name="环境指标", group_name_en="environment")
+    builder = _add_multi_metric_panels(builder, environment_panels).end_group()
+
+    builder = builder.add_group(group_name="PPO指标", group_name_en="ppo")
+    builder = _add_multi_metric_panels(builder, ppo_panels).end_group()
+
+    builder = builder.add_group(group_name="奖励分组", group_name_en="reward")
+    builder = _add_multi_metric_panels(builder, reward_panels).end_group()
+
+    builder = builder.add_group(group_name="行为诊断", group_name_en="behavior")
+    builder = _add_multi_metric_panels(builder, behavior_panels).end_group()
+
+    return builder.build()
