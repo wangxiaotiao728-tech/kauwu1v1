@@ -19,42 +19,10 @@ from agent_ppo.feature.definition import (
 from agent_ppo.conf.conf import GameConfig
 from tools.env_conf_manager import EnvConfManager
 from tools.model_pool_utils import get_valid_model_pool
-from tools.metrics_utils import get_training_metrics
 from common_python.utils.workflow_disaster_recovery import handle_disaster_recovery
 
 
-# Metrics used by monitor_builder.py.
-# 说明：
-# 1. 旧 D401 指标保留。
-# 2. 新增指标只追加。
-# 3. learner-only 指标不兜底上报 0，避免 value_loss/policy_loss 显示假 0。
-OLD_D401_KEYS = [
-    "hero_hurt",
-    "total_damage",
-    "hero_damage",
-    "crit",
-    "skill_hit",
-    "no_ops",
-    "in_grass",
-    "under_tower_behavior",
-    "passive_skills",
-]
-
-LEARNER_ONLY_KEYS = {
-    "total_loss",
-    "value_loss",
-    "policy_loss",
-    "entropy_loss",
-    "approx_kl",
-    "clip_fraction",
-    "learning_rate",
-    "entropy_beta",
-    "ppo_clip",
-    "grad_norm",
-    "hidden_norm",
-    "feature_nan_count",
-}
-
+# Workflow-side monitor metrics used by monitor_builder.py.
 MATCHUP_PAIRS = [(112, 112), (112, 133), (133, 112), (133, 133)]
 MATCHUP_MONITOR_KEYS = []
 for _my_hero_id, _enemy_hero_id in MATCHUP_PAIRS:
@@ -66,16 +34,12 @@ for _my_hero_id, _enemy_hero_id in MATCHUP_PAIRS:
         f"{_prefix}_game_total",
     ])
 
-NEW_MONITOR_KEYS = [
+MONITOR_KEYS = [
     # environment
     "reward", "episode_cnt", "frame_no", "win",
     "my_hp", "enemy_hp", "own_tower_hp_ratio", "enemy_tower_hp_ratio",
+    "my_money", "enemy_money", "my_exp", "enemy_exp", "my_level", "enemy_level",
     "kill_count", "death_count", "cake_count", "neutral_count",
-
-    # ppo / learner
-    "total_loss", "value_loss", "policy_loss", "entropy_loss",
-    "approx_kl", "clip_fraction", "learning_rate", "entropy_beta", "ppo_clip",
-    "grad_norm", "hidden_norm", "feature_nan_count",
 
     # reward groups
     "reward_objective", "reward_growth_combat", "reward_behavior_safety",
@@ -84,7 +48,8 @@ NEW_MONITOR_KEYS = [
     "tower_hp_point", "kill", "death",
     "money", "exp", "last_hit",
     "hp_point", "hero_hurt", "hero_damage", "total_damage",
-    "lane_clear", "defense", "cake", "forward",
+    "enemy_pressure", "combat_intent", "trade_advantage",
+    "lane_clear", "defense", "cake", "forward", "lane_presence", "home_idle", "respawn_leave_base",
     "tower_risk", "stuck", "no_ops", "grass_behavior",
     "skill_hit", "crit", "in_grass", "under_tower_behavior", "passive_skills",
 
@@ -100,20 +65,10 @@ NEW_MONITOR_KEYS = [
     "own_cake_pick_count", "low_hp_own_cake_approach_count",
 ] + MATCHUP_MONITOR_KEYS
 
-
-def _dedup_keys(keys):
-    out = []
-    for key in keys:
-        if key not in out:
-            out.append(key)
-    return out
-
-
-MONITOR_KEYS = _dedup_keys(OLD_D401_KEYS + NEW_MONITOR_KEYS)
-
 # These keys should be averaged over the episode if emitted per decision frame.
 AVG_MONITOR_KEYS = {
     "my_hp", "enemy_hp", "own_tower_hp_ratio", "enemy_tower_hp_ratio",
+    "my_money", "enemy_money", "my_exp", "enemy_exp", "my_level", "enemy_level",
     "in_grass", "under_tower_behavior",
     "enemy_soldier_count", "friendly_soldier_count",
     "enemy_soldier_near_own_tower_count",
@@ -128,9 +83,10 @@ REWARD_GROUPS_FOR_MONITOR = {
     "reward_growth_combat": [
         "hp_point", "money", "exp", "last_hit", "hero_hurt",
         "total_damage", "hero_damage", "skill_hit",
+        "enemy_pressure", "combat_intent", "trade_advantage",
     ],
     "reward_behavior_safety": [
-        "lane_clear", "defense", "cake", "forward", "tower_risk", "stuck",
+        "lane_clear", "defense", "cake", "forward", "lane_presence", "home_idle", "respawn_leave_base", "tower_risk", "stuck",
         "no_ops", "grass_behavior",
     ],
 }
@@ -197,8 +153,6 @@ class EpisodeRunner:
         self.agent_num = len(agents)
         self.episode_cnt = 0
         self.last_report_monitor_time = 0
-        self.last_training_metric_log_time = 0
-        self.latest_training_metrics = {}
         self.matchup_stats = {
             f"matchup_{my_hero_id}_vs_{enemy_hero_id}": {"game": 0.0, "win": 0.0}
             for my_hero_id, enemy_hero_id in MATCHUP_PAIRS
@@ -218,47 +172,6 @@ class EpisodeRunner:
             return float(value)
         except Exception:
             return 0.0
-
-    @classmethod
-    def _flatten_training_metrics(cls, metrics):
-        """
-        Flatten learner metrics and normalize common aliases.
-
-        Some learner implementations return nested dicts or slightly different key names.
-        This function keeps original keys and also writes normalized monitor keys.
-        """
-        flat = {}
-        if not isinstance(metrics, dict):
-            return flat
-
-        def put(k, v):
-            flat[str(k)] = cls._safe_float(v)
-
-        for key, value in metrics.items():
-            if isinstance(value, dict):
-                for sub_key, sub_value in value.items():
-                    put(sub_key, sub_value)
-            else:
-                put(key, value)
-
-        # Common aliases -> monitor keys. Keep this defensive; unknown keys remain untouched.
-        alias_map = {
-            "lr": "learning_rate",
-            "learn_rate": "learning_rate",
-            "clip": "ppo_clip",
-            "clip_param": "ppo_clip",
-            "beta": "entropy_beta",
-            "var_beta": "entropy_beta",
-            "kl": "approx_kl",
-            "approximate_kl": "approx_kl",
-            "clip_frac": "clip_fraction",
-            "clip_ratio": "clip_fraction",
-        }
-        for src, dst in alias_map.items():
-            if src in flat and dst not in flat:
-                flat[dst] = flat[src]
-
-        return flat
 
     @staticmethod
     def _new_monitor_acc():
@@ -377,11 +290,17 @@ class EpisodeRunner:
                     break
             if my_hero:
                 data["my_hp"] = self._safe_float(my_hero.get("hp", 0)) / max(1.0, self._safe_float(my_hero.get("max_hp", 1)))
+                data["my_money"] = self._safe_float(my_hero.get("money_cnt", my_hero.get("money", 0)))
+                data["my_exp"] = self._safe_float(my_hero.get("exp", 0))
+                data["my_level"] = self._safe_float(my_hero.get("level", 0))
                 data["kill_count"] = self._safe_float(my_hero.get("kill_cnt", 0))
                 data["death_count"] = self._safe_float(my_hero.get("dead_cnt", 0))
                 data["in_grass"] = 1.0 if bool(my_hero.get("is_in_grass", False)) else 0.0
             if enemy_hero:
                 data["enemy_hp"] = self._safe_float(enemy_hero.get("hp", 0)) / max(1.0, self._safe_float(enemy_hero.get("max_hp", 1)))
+                data["enemy_money"] = self._safe_float(enemy_hero.get("money_cnt", enemy_hero.get("money", 0)))
+                data["enemy_exp"] = self._safe_float(enemy_hero.get("exp", 0))
+                data["enemy_level"] = self._safe_float(enemy_hero.get("level", 0))
             own_tower = None
             enemy_tower = None
             friendly_soldier_ids = set()
@@ -743,21 +662,6 @@ class EpisodeRunner:
         # Single environment process
         # 单局流程
         while True:
-            # Retrieving training metrics
-            # 获取训练中的指标
-            training_metrics = get_training_metrics()
-            if training_metrics:
-                self.latest_training_metrics = self._flatten_training_metrics(training_metrics)
-                now = time.time()
-                if self.logger and now - self.last_training_metric_log_time >= 60:
-                    compact_metrics = {
-                        key: round(self._safe_float(self.latest_training_metrics.get(key, 0.0)), 6)
-                        for key in sorted(LEARNER_ONLY_KEYS)
-                        if key in self.latest_training_metrics
-                    }
-                    self.logger.info(f"training_metrics summary {compact_metrics}")
-                    self.last_training_metric_log_time = now
-
             # Update environment configuration
             # Can use a list of length 2 to pass in the lineup id of the current game
             # 更新对局配置, 可以用长度为2的列表传入当前对局的阵容id
@@ -927,18 +831,9 @@ class EpisodeRunner:
                         monitor_data.update(self._matchup_monitor_items(lineup, report_side, win_value))
                         monitor_data.update(self._matchup_rate_monitor_items())
 
-                        # Merge learner-side PPO metrics.
-                        # IMPORTANT: monitor panels with multiple lines expect every metric to be present
-                        # on every report. If a learner metric is temporarily absent, keep its last cached
-                        # value if available; otherwise report 0.0 only before the first learner update.
-                        for key in LEARNER_ONLY_KEYS:
-                            if key in self.latest_training_metrics:
-                                monitor_data[key] = self.latest_training_metrics[key]
-                            else:
-                                monitor_data[key] = monitor_data.get(key, 0.0)
-
-                        # Ensure every registered key has a value at every report.
-                        # This prevents missing lines/gaps in multi-metric panels.
+                        # Ensure every workflow-side monitor key has a value at every report.
+                        # Learner-only loss metrics are reported by Algorithm.learn(), matching
+                        # the baseline path and avoiding stale episode-side values.
                         for key in MONITOR_KEYS:
                             monitor_data[key] = round(self._safe_float(monitor_data.get(key, 0.0)), 6)
 

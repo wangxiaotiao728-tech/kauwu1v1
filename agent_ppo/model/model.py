@@ -349,11 +349,53 @@ class Model(nn.Module):
             else:
                 entropy_loss_list.append(torch.tensor(0.0, device=seri_vec.device))
 
+        policy_head_denom = max(1, active_task_cnt)
         self.entropy_cost = torch.stack(entropy_loss_list).sum()
         self.entropy_cost_list = entropy_loss_list
         self.approx_kl = approx_kl_sum / max(1, active_task_cnt)
         self.clip_fraction = clip_frac_sum / max(1, active_task_cnt)
         self.loss = self.value_cost + self.policy_cost + self.var_beta * self.entropy_cost
+        policy_cost_per_head = self.policy_cost / policy_head_denom
+        entropy_cost_per_head = self.entropy_cost / policy_head_denom
+        diagnostic_total_loss = self.value_cost + policy_cost_per_head + self.var_beta * entropy_cost_per_head
+
+        with torch.no_grad():
+            zero = torch.tensor(0.0, device=seri_vec.device)
+            if torch.sum(valid_mask) > 0:
+                value_target_abs_mean = torch.mean(torch.abs(reward[valid_mask]))
+                value_pred_abs_mean = torch.mean(torch.abs(value_pred[valid_mask]))
+                adv_abs_mean = torch.mean(torch.abs(advantage[valid_mask]))
+                adv_std = torch.std(advantage[valid_mask], unbiased=False)
+                if group_num > 0 and len(group_returns) > 0:
+                    group_targets = torch.stack(group_returns, dim=1)
+                    group_value_target_abs_mean = torch.mean(torch.abs(group_targets[valid_mask]))
+                else:
+                    group_value_target_abs_mean = zero
+            else:
+                value_target_abs_mean = zero
+                value_pred_abs_mean = zero
+                adv_abs_mean = zero
+                adv_std = zero
+                group_value_target_abs_mean = zero
+
+            self.loss_diagnostics = {
+                "global_value_loss": global_value_cost.detach(),
+                "group_value_loss": group_value_cost.detach(),
+                "policy_entropy": (-self.entropy_cost).detach(),
+                "policy_head_count": torch.tensor(float(policy_head_denom), device=seri_vec.device),
+                "policy_loss_per_head": policy_cost_per_head.detach(),
+                "entropy_loss_per_head": entropy_cost_per_head.detach(),
+                "diagnostic_total_loss": diagnostic_total_loss.detach(),
+                "policy_value_abs_ratio": (
+                    torch.abs(policy_cost_per_head) / (torch.abs(self.value_cost) + 1e-6)
+                ).detach(),
+                "adv_abs_mean": adv_abs_mean.detach(),
+                "adv_std": adv_std.detach(),
+                "value_target_abs_mean": value_target_abs_mean.detach(),
+                "value_pred_abs_mean": value_pred_abs_mean.detach(),
+                "group_value_target_abs_mean": group_value_target_abs_mean.detach(),
+                "train_frame_ratio": torch.mean((frame_is_train > 0.5).float()).detach(),
+            }
 
         return self.loss, [
             self.loss,

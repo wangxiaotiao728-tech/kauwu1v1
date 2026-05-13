@@ -63,26 +63,33 @@ class GameConfig:
     REWARD_WEIGHT_DICT = {
         # objective
         "tower_hp_point": 8.0,
-        "kill": 1.0,
+        "kill": 2.0,
         "death": -1.0,
         # growth / combat
-        "hp_point": 1.0,
-        "money": 0.02,
-        "exp": 0.02,
-        "last_hit": 0.06,
-        "hero_hurt": -0.10,
+        "hp_point": 0.35,
+        "money": 0.08,
+        "exp": 0.08,
+        "monster_resource": 0.08,
+        "last_hit": 0.24,
+        "hero_hurt": -0.04,
         "total_damage": 0.03,
-        "hero_damage": 0.05,
-        "skill_hit": 0.02,
+        "hero_damage": 0.18,
+        "skill_hit": 0.06,
+        "enemy_pressure": 0.16,
+        "combat_intent": 0.12,
+        "trade_advantage": 0.10,
         # behavior / safety
-        "lane_clear": 0.12,
-        "defense": 0.08,
+        "lane_clear": 0.26,
+        "defense": 0.12,
         "cake": 0.05,
         "tower_risk": 0.03,
-        "stuck": -0.12,
-        "no_ops": -0.03,
+        "stuck": -0.35,
+        "no_ops": -0.15,
         "grass_behavior": 0.03,
-        "forward": 0.20,
+        "forward": 0.0,
+        "lane_presence": 0.0,
+        "home_idle": -0.55,
+        "respawn_leave_base": 0.0,
         # disabled / monitor-only
         "bad_skill": 0.0,
         "passive_skills": 0.0,
@@ -90,7 +97,6 @@ class GameConfig:
         "in_grass": 0.0,
         # optional old baseline keys kept off
         "ep_rate": 0.0,
-        "monster_resource": 0.0,
     }
 
     REWARD_GROUPS = {
@@ -99,17 +105,24 @@ class GameConfig:
             "hp_point",
             "money",
             "exp",
+            "monster_resource",
             "last_hit",
             "hero_hurt",
             "total_damage",
             "hero_damage",
             "skill_hit",
+            "enemy_pressure",
+            "combat_intent",
+            "trade_advantage",
         ],
         "behavior_safety": [
             "lane_clear",
             "defense",
             "cake",
             "forward",
+            "lane_presence",
+            "home_idle",
+            "respawn_leave_base",
             "tower_risk",
             "stuck",
             "no_ops",
@@ -120,8 +133,13 @@ class GameConfig:
     REWARD_GROUP_ADV_WEIGHTS = {"objective": 1.0, "growth_combat": 1.0, "behavior_safety": 1.0}
     NO_DECAY_REWARD_KEYS = set(REWARD_GROUPS["objective"])
 
-    # 0 disables decay. Keep a mild decay for shaping terms only.
-    TIME_SCALE_ARG = 20000
+    # 0 disables single-episode reward decay.
+    TIME_SCALE_ARG = 0
+    RESPAWN_LEAVE_BASE_STEPS = 120
+    LANE_TARGET_PROGRESS = 0.35
+    BASE_STAY_PROGRESS = 0.12
+    REWARD_GROUP_CLIP = {"objective": 5.0, "growth_combat": 2.0, "behavior_safety": 2.0}
+    REWARD_SUM_CLIP = 5.0
     MODEL_SAVE_INTERVAL = 1800
 
     # Debug switches.
@@ -186,12 +204,12 @@ class Config:
     )
     SERI_VEC_SPLIT_SHAPE = [(FEATURE_DIM,), (LEGAL_ACTION_DIM,)]
 
-    # LR schedule: warmup to BASE_LR, then cosine decay. The existing Agent uses
+    # LR schedule: cosine decay from INIT_LEARNING_RATE_START to MIN_LR. The existing Agent uses
     # LambdaLR, so these values are consumed in Agent.lr_lambda.
-    INIT_LEARNING_RATE_START = 8e-5
+    INIT_LEARNING_RATE_START = 5e-5
     WARMUP_LR = 2e-5
-    WARMUP_STEPS = 5000
-    MIN_LR = 2e-5
+    WARMUP_STEPS = 0
+    MIN_LR = 1e-5
     TARGET_LR = MIN_LR
     TARGET_STEP = 180000
 

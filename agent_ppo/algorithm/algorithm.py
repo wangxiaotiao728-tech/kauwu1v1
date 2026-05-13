@@ -105,11 +105,17 @@ class Algorithm:
         approx_kl = metric_list[3] if len(metric_list) > 3 else 0.0
         clip_fraction = metric_list[4] if len(metric_list) > 4 else 0.0
         lr = self.optimizer.param_groups[0].get("lr", 0.0)
+
+        def metric_value(value, digits=6):
+            if hasattr(value, "item"):
+                value = value.item()
+            return round(float(value), digits)
+
         results = {
-            "total_loss": round(float(last_total_loss.item()), 4),
-            "value_loss": round(value_loss, 4),
-            "policy_loss": round(policy_loss, 4),
-            "entropy_loss": round(entropy_loss, 4),
+            "total_loss": metric_value(last_total_loss),
+            "value_loss": metric_value(value_loss),
+            "policy_loss": metric_value(policy_loss),
+            "entropy_loss": metric_value(entropy_loss),
             "approx_kl": round(approx_kl, 6),
             "clip_fraction": round(clip_fraction, 4),
             "learning_rate": round(lr, 8),
@@ -119,6 +125,8 @@ class Algorithm:
             "entropy_beta": round(float(getattr(self.model, "var_beta", 0.0)), 6),
             "ppo_clip": round(float(getattr(self.model, "clip_param", 0.0)), 4),
         }
+        for key, value in getattr(self.model, "loss_diagnostics", {}).items():
+            results[key] = metric_value(value)
         now = time.time()
         if now - self.last_report_monitor_time >= 60:
             if self.monitor:

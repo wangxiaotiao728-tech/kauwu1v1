@@ -234,7 +234,6 @@ class FeatureProcess:
         self.prev_enemy_total_hurt = 0.0
         self.last_own_tower_seen = {"x": 0.0, "z": 0.0, "frame": 0, "hp": 1.0}
         self.last_enemy_tower_seen = {"x": 0.0, "z": 0.0, "frame": 0, "hp": 1.0}
-        self.last_context: Dict[str, float] = {}
 
     def reset(self):
         self.__init__(self.main_camp)
@@ -675,13 +674,6 @@ class FeatureProcess:
             _clip(self.grass_no_effective_steps / 30.0),
             1.0 if in_grass and defense_emergency else 0.0,
         ]
-        self.last_context.update({
-            "stuck_score": vals[11],
-            "defense_emergency": vals[18],
-            "is_in_grass": vals[20],
-            "grass_no_effective_steps": self.grass_no_effective_steps,
-            "lane_visible": 1.0 if lane_visible else 0.0,
-        })
         return self._append_pad(vals, 24)
 
     def process_feature(self, observation):
@@ -689,7 +681,6 @@ class FeatureProcess:
         frame_no = int(frame_state.get("frame_no", 0) or 0)
         main_hero, enemy_hero = self._find_heroes(frame_state)
         if main_hero is None:
-            self.last_context = {}
             return [0.0] * FEATURE_DIM
 
         soldiers, towers, monsters = self._split_npcs(frame_state)
@@ -708,9 +699,6 @@ class FeatureProcess:
         enemy_tower_ref = self._tower_ref(enemy_tower, self.last_enemy_tower_seen, enemy_tower_pos, enemy_camp)
         own_cake, enemy_cake = self._split_cakes(frame_state, own_tower_ref, enemy_tower_ref)
         lane_visible = len(friendly_soldiers) + len(enemy_soldiers) > 0
-        main_pos = _loc(main_hero)
-        enemy_tower_dx = enemy_tower_pos["x"] - main_pos["x"]
-        enemy_tower_dz = enemy_tower_pos["z"] - main_pos["z"]
         enemy_tower_dist = _dist_actor(main_hero, enemy_tower_ref)
         enemy_tower_target = _get_any(enemy_tower_ref, "attack_target", default=0)
         friendly_ids = set(_runtime_id(s) for s in friendly_soldiers)
@@ -719,21 +707,6 @@ class FeatureProcess:
         in_enemy_tower = enemy_tower_dist <= enemy_tower_range
         unsafe_tower_entry = in_enemy_tower and not friendly_tanking_enemy_tower
         tower_target_me = enemy_tower is not None and enemy_tower_target == _runtime_id(main_hero)
-
-        self.last_context = {
-            "enemy_visible": 1.0 if enemy_hero is not None and _is_visible_to(enemy_hero, self.main_camp) else 0.0,
-            "enemy_dist": _dist_actor(main_hero, enemy_hero) if enemy_hero is not None else DIST_NORM,
-            "enemy_soldier_count": float(len(enemy_soldiers)),
-            "friendly_soldier_count": float(len(friendly_soldiers)),
-            "friendly_soldier_tanking_enemy_tower": 1.0 if friendly_tanking_enemy_tower else 0.0,
-            "unsafe_tower_entry": 1.0 if unsafe_tower_entry or tower_target_me else 0.0,
-            "own_cake_exists": 1.0 if own_cake is not None else 0.0,
-            "my_hp_ratio": _hp_rate(main_hero),
-            "enemy_tower_dx": enemy_tower_dx,
-            "enemy_tower_dz": enemy_tower_dz,
-            "enemy_tower_dist": enemy_tower_dist,
-            "opening_move": 1.0 if frame_no < 3000 and (not lane_visible) and _hp_rate(main_hero) > 0.55 else 0.0,
-        }
 
         groups = [
             self._extract_self_group(frame_no, main_hero, enemy_hero, friendly_soldiers, enemy_soldiers, own_tower_ref, enemy_tower_ref),
